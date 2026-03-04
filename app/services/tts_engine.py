@@ -160,8 +160,129 @@ class TTSEngine:
         except Exception as e:
             logger.error(f"Voice encoding failed: {e}")
             raise
+        def synthesize_ssml(
+        self,
+        ssml_text: str,
+        voice_embedding: Optional[np.ndarray] = None,
+        language: str = "en",
+    ) -> Tuple[np.ndarray, int]:
+        """
+        Synthesize SSML with phrase-level control.
+        
+        Args:
+            ssml_text: SSML markup
+            voice_embedding: Speaker embedding for voice cloning
+            language: Language code
+        
+        Returns:
+            Tuple of (audio_array, sample_rate)
+        """
+        from app.services.ssml import SSMLParser
+        
+        if not self._initialized:
+            self.initialize()
+        
+        logger.info(f"Synthesizing SSML (len={len(ssml_text)})")
+        
+        try:
+            # Parse SSML
+            parser = SSMLParser()
+            segments = parser.parse(ssml_text)
+            
+            # Synthesize each segment and combine
+            audio_parts = []
+            
+            for segment in segments:
+                if not segment.text.strip():
+                    continue
+                
+                # Synthesize segment text
+                audio, sr = self.synthesize(
+                    text=segment.text,
+                    voice_embedding=voice_embedding,
+                    speed=self._parse_prosody_rate(segment.prosody_rate),
+                    pitch=self._parse_prosody_pitch(segment.prosody_pitch),
+                    style="normal",
+                )
+                
+                audio_parts.append(audio)
+                
+                # Add break after segment
+                if segment.break_after > 0:
+                    silence_samples = int(sr * segment.break_after / 1000)
+                    silence = np.zeros(silence_samples, dtype=np.float32)
+                    audio_parts.append(silence)
+            
+            # Combine all parts
+            if audio_parts:
+                combined_audio = np.concatenate(audio_parts)
+                return combined_audio, sr
+            else:
+                # Empty SSML
+                return np.zeros(self.sample_rate, dtype=np.float32), self.sample_rate
+        
+        except Exception as e:
+            logger.error(f"SSML synthesis failed: {e}")
+            raise
     
-    def synthesize_batch(
+    def _parse_prosody_rate(self, rate_str: Optional[str]) -> float:
+        """Parse prosody rate string to multiplier."""
+        if not rate_str:
+            return 1.0
+        
+        rate_map = {
+            "x-slow": 0.6,
+            "slow": 0.8,
+            "medium": 1.0,
+            "fast": 1.2,
+            "x-fast": 1.5,
+        }
+        
+        if rate_str in rate_map:
+            return rate_map[rate_str]
+        
+        # Parse percentage or decimal
+        if "%" in rate_str:
+            return float(rate_str.rstrip("%")) / 100
+        
+        try:
+            return float(rate_str)
+        except ValueError:
+            return 1.0
+    
+    def _parse_prosody_pitch(self, pitch_str: Optional[str]) -> float:
+        """Parse prosody pitch string to multiplier."""
+        if not pitch_str:
+            return 1.0
+        
+        pitch_map = {
+            "x-low": 0.5,
+            "low": 0.75,
+            "medium": 1.0,
+            "high": 1.25,
+            "x-high": 1.5,
+        }
+        
+        if pitch_str in pitch_map:
+            return pitch_map[pitch_str]
+        
+        # Parse percentage
+        if "%" in pitch_str:
+            base_pitch = 1.0
+            adjustment = float(pitch_str.lstrip("+").rstrip("%")) / 100
+            return base_pitch + adjustment
+        
+        # Parse Hz
+        if "Hz" in pitch_str:
+            hz = float(pitch_str.rstrip("Hz"))
+            # Normalize Hz to multiplier (assuming base ~100Hz)
+            return hz / 100
+        
+        try:
+            return float(pitch_str)
+        except ValueError:
+            return 1.0
+        def synthesize_batch(
         self,
         texts: list[str],
         voice_embeddings: Optional[list[np.ndarray]] = None,

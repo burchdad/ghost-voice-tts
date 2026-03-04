@@ -133,6 +133,65 @@ failed_jobs = Gauge(
     registry=metrics_registry,
 )
 
+# ============ Rate Limiting & Security ============
+
+rate_limit_exceeded_total = Counter(
+    "tts_rate_limit_exceeded_total",
+    "Total number of rate limit exceeded events",
+    ["tier", "endpoint"],
+    registry=metrics_registry,
+)
+
+authentication_failures_total = Counter(
+    "tts_authentication_failures_total",
+    "Total number of authentication failures",
+    ["auth_type"],
+    registry=metrics_registry,
+)
+
+circuit_breaker_state_changes_total = Counter(
+    "tts_circuit_breaker_state_changes_total",
+    "Total circuit breaker state changes",
+    ["service", "state"],
+    registry=metrics_registry,
+)
+
+error_total = Counter(
+    "tts_errors_total",
+    "Total errors by type and severity",
+    ["error_type", "severity"],
+    registry=metrics_registry,
+)
+
+request_latency_seconds = Histogram(
+    "tts_request_latency_seconds",
+    "Request latency in seconds",
+    ["endpoint", "method"],
+    buckets=(0.01, 0.05, 0.1, 0.5, 1.0, 2.0, 5.0),
+    registry=metrics_registry,
+)
+
+http_requests_total = Counter(
+    "tts_http_requests_total",
+    "Total HTTP requests",
+    ["method", "endpoint", "status"],
+    registry=metrics_registry,
+)
+
+concurrent_requests = Gauge(
+    "tts_concurrent_requests",
+    "Current number of concurrent requests",
+    ["endpoint"],
+    registry=metrics_registry,
+)
+
+circuit_breaker_open_gauge = Gauge(
+    "tts_circuit_breaker_open",
+    "Circuit breaker open state (1=open, 0=closed)",
+    ["service"],
+    registry=metrics_registry,
+)
+
 
 # ============ Metrics Collectors ============
 
@@ -227,6 +286,59 @@ class MetricsCollector:
     def set_db_pool_size(size: int):
         """Set database connection pool size."""
         database_connection_pool_size.set(size)
+    
+    @staticmethod
+    def record_rate_limit_exceeded(tier: str, endpoint: str):
+        """Record rate limit exceeded event."""
+        rate_limit_exceeded_total.labels(tier=tier, endpoint=endpoint).inc()
+    
+    @staticmethod
+    def record_authentication_failure(auth_type: str = "unknown"):
+        """Record authentication failure."""
+        authentication_failures_total.labels(auth_type=auth_type).inc()
+    
+    @staticmethod
+    def record_circuit_breaker_open(service: str):
+        """Record circuit breaker opening."""
+        circuit_breaker_state_changes_total.labels(service=service, state="open").inc()
+        circuit_breaker_open_gauge.labels(service=service).set(1)
+    
+    @staticmethod
+    def record_circuit_breaker_closed(service: str):
+        """Record circuit breaker closing."""
+        circuit_breaker_state_changes_total.labels(service=service, state="closed").inc()
+        circuit_breaker_open_gauge.labels(service=service).set(0)
+    
+    @staticmethod
+    def record_error(error_type: str, severity: str = "error"):
+        """Record an error occurrence."""
+        error_total.labels(error_type=error_type, severity=severity).inc()
+    
+    @staticmethod
+    def record_request_latency(endpoint: str, method: str, duration: float):
+        """Record HTTP request latency."""
+        request_latency_seconds.labels(endpoint=endpoint, method=method).observe(duration)
+    
+    @staticmethod
+    def record_http_request(method: str, endpoint: str, status_code: int):
+        """Record HTTP request."""
+        http_requests_total.labels(method=method, endpoint=endpoint, status=str(status_code)).inc()
+    
+    @staticmethod
+    def increment_concurrent_requests(endpoint: str):
+        """Increment concurrent request counter."""
+        concurrent_requests.labels(endpoint=endpoint).inc()
+    
+    @staticmethod
+    def decrement_concurrent_requests(endpoint: str):
+        """Decrement concurrent request counter."""
+        concurrent_requests.labels(endpoint=endpoint).dec()
+    
+    @staticmethod
+    def record_metric(name: str, value: float):
+        """Record a generic metric (for custom tracking)."""
+        # This would need a generic metric to be defined
+        pass
 
 
 logger = logging.getLogger(__name__)

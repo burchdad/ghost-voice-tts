@@ -147,6 +147,29 @@ class BatchSynthesisResponse(BaseModel):
     results: List[SynthesisResponse]
 
 
+# ============ SSML Synthesis Schemas ============
+
+class SSMLSynthesisRequest(BaseModel):
+    """Synthesis request with SSML (Speech Synthesis Markup Language) support."""
+    ssml: str = Field(
+        ...,
+        min_length=10,
+        max_length=5000,
+        description="SSML markup for fine-grained control over synthesis",
+    )
+    voice_id: str
+    language: LanguageEnum  = LanguageEnum.EN
+    stream: bool = Field(default=False)
+
+
+class SSMLValidationResponse(BaseModel):
+    """Response from SSML validation."""
+    is_valid: bool
+    error: Optional[str] = None
+    plain_text: Optional[str] = None
+    character_count: Optional[int] = None
+
+
 # ============ Health & Status Schemas ============
 
 class HealthResponse(BaseModel):

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session
@@ -15,13 +15,16 @@ from app.core.metrics import metrics_registry, MetricsCollector
 from app.schemas.tts import (
     SynthesisRequest, SynthesisResponse,
     VoiceResponse, VoiceCloningRequest, VoiceUpdate,
-    HealthResponse, UserResponse,
+    HealthResponse, UserResponse, SSMLSynthesisRequest,
 )
 from app.models.db import User, Voice, SynthesisJob
 from app.services.tts_engine import get_tts_engine
 from app.services.cache import get_redis_cache
 from app.services.streaming import StreamingTTSManager
+from app.services.security import get_security_manager, TokenResponse
 from app.tasks.synthesis import synthesize_text_task, encode_voice_samples_task
+from app.middleware import setup_middlewares
+from app.dependencies import get_current_user, get_current_user_optional
 
 # Setup
 setup_logging()
@@ -44,6 +47,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Setup security, rate limiting, and observability middleware
+setup_middlewares(app)
 
 
 # ============ Startup & Shutdown ============
@@ -118,7 +124,7 @@ async def prometheus_metrics():
 
 # ============ User Endpoints ============
 
-@app.post("/users/register", response_model=UserResponse)
+@app.post("/auth/register", response_model=TokenResponse)
 async def register_user(
     username: str,
     email: str,
@@ -132,30 +138,118 @@ async def register_user(
     ).first()
     
     if existing:
-        raise HTTPException(status_code=400, detail="User already exists")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User already exists",
+        )
+    
+    security_mgr = get_security_manager()
+    hashed_pwd = security_mgr.hash_password(password)
     
     user = User(
         email=email,
         username=username,
-        hashed_password=password,  # In production, hash this!
+        hashed_password=hashed_pwd,
+        tier="free",
     )
     session.add(user)
     session.commit()
     session.refresh(user)
     
+    # Return JWT token
+    token_response = security_mgr.create_access_token(
+        user_id=user.id,
+        email=user.email,
+        tier=user.tier,
+    )
+    return token_response
+
+
+@app.post("/auth/login", response_model=TokenResponse)
+async def login_user(
+    email: str,
+    password: str,
+    session: Session = Depends(get_session),
+):
+    """Authenticate user and return JWT token."""
+    user = session.query(User).filter(User.email == email).first()
+    
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+        )
+    
+    security_mgr = get_security_manager()
+    if not security_mgr.verify_password(password, user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+        )
+    
+    # Return JWT token
+    token_response = security_mgr.create_access_token(
+        user_id=user.id,
+        email=user.email,
+        tier=user.tier,
+    )
+    return token_response
+
+
+@app.post("/auth/refresh", response_model=TokenResponse)
+async def refresh_token(
+    user: User = Depends(get_current_user),
+):
+    """Refresh JWT token."""
+    security_mgr = get_security_manager()
+    token_response = security_mgr.create_access_token(
+        user_id=user.id,
+        email=user.email,
+        tier=user.tier,
+    )
+    return token_response
+
+
+@app.get("/me", response_model=UserResponse)
+async def get_current_user_info(
+    user: User = Depends(get_current_user),
+):
+    """Get current user information."""
     return user
+
+
+@app.post("/auth/api-keys/generate")
+async def generate_api_key(
+    label: str = "",
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Generate a new API key for the user."""
+    security_mgr = get_security_manager()
+    raw_key, hashed_key = security_mgr.generate_api_key(label)
+    
+    # Save to database
+    from app.models.db import APIKeyModel
+    api_key = APIKeyModel(
+        user_id=user.id,
+        hashed_key=hashed_key,
+        label=label,
+    )
+    session.add(api_key)
+    session.commit()
+    
+    return {
+        "api_key": raw_key,
+        "label": label,
+        "note": "Save this key somewhere safe. You won't be able to see it again!",
+    }
 
 
 @app.get("/me/quota")
 async def get_my_quota(
-    authorization: str = Header(None),
-    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
 ):
     """Get current user's quota information."""
-    
-    user = session.query(User).filter(User.is_active == True).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
     
     from app.services.quota import get_quota_manager
     quota_mgr = get_quota_manager()
@@ -430,6 +524,225 @@ async def synthesize_batch(
         "total_characters": max_chars,
         "message": "Batch synthesis started. Poll individual jobs for status."
     }
+
+
+# ============ SSML Synthesis Endpoints ============
+
+@app.post("/ssml/validate")
+async def validate_ssml(
+    ssml: str,
+):
+    """
+    Validate SSML syntax without synthesizing.
+    
+    Useful for testing SSML before sending synthesis request.
+    """
+    from app.services.ssml import validate_ssml, SSMLParser
+    
+    is_valid, error = validate_ssml(ssml)
+    
+    if not is_valid:
+        return {
+            "is_valid": False,
+            "error": error,
+        }
+    
+    # Extract plain text
+    parser = SSMLParser()
+    segments = parser.parse(ssml)
+    plain_text = parser.to_plain_text()
+    
+    return {
+        "is_valid": True,
+        "plain_text": plain_text,
+        "character_count": len(plain_text),
+        "segment_count": len(segments),
+    }
+
+
+@app.post("/synthesize-ssml", response_model=SynthesisResponse)
+async def synthesize_ssml(
+    request: SSMLSynthesisRequest,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """
+    Synthesize SSML with phrase-level control.
+    
+    SSML allows fine-grained control over:
+    - <emphasis> - Emphasize text
+    - <break> - Pause/silence
+    - <prosody pitch="..." rate="..." volume="..."> - Adjust pitch, speed, volume
+    - <phoneme> - Explicit pronunciation
+    - <voice> - Switch to different voice
+    
+    Example:
+        {
+            "ssml": "<speak>Hello <emphasis level='strong'>world</emphasis>. <break time='500ms'/> How are you?</speak>",
+            "voice_id": "voice-123",
+            "language": "en"
+        }
+    """
+    from app.services.ssml import SSMLParser, is_ssml
+    from app.services.quota import get_quota_manager
+    
+    # Validate SSML
+    parser = SSMLParser()
+    try:
+        segments = parser.parse(request.ssml)
+    except Exception as e:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid SSML: {str(e)}",
+        )
+    
+    # Get plain text for quota check
+    plain_text = parser.to_plain_text()
+    text_length = len(plain_text)
+    
+    # Check quota
+    quota_mgr = get_quota_manager()
+    can_proceed, remaining = quota_mgr.check_monthly_quota(user, text_length)
+    
+    if not can_proceed:
+        MetricsCollector.record_rate_limit_exceeded(user.tier, "/synthesize-ssml")
+        raise HTTPException(
+            status_code=429,
+            detail=f"Quota exceeded. Remaining: {remaining} characters",
+        )
+    
+    # Get voice
+    voice = session.query(Voice).filter(Voice.id == request.voice_id).first()
+    if not voice:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    
+    # Create synthesis job
+    job = SynthesisJob(
+        text=plain_text,
+        ssml=request.ssml,
+        voice_id=request.voice_id,
+        user_id=user.id,
+        language=request.language,
+        status="pending",
+    )
+    session.add(job)
+    session.commit()
+    session.refresh(job)
+    
+    # Queue synthesis task
+    from app.tasks.synthesis import synthesize_text_task
+    
+    voice_embedding_bytes = voice.speaker_embedding or b""
+    
+    task = synthesize_text_task.apply_async(
+        kwargs={
+            "job_id": job.id,
+            "text": request.ssml,
+            "voice_id": request.voice_id,
+            "voice_embedding_bytes": voice_embedding_bytes,
+            "language": request.language,
+            "is_ssml": True,
+        },
+        task_id=f"synthesis-{job.id}",
+    )
+    
+    # Deduct quota
+    quota_mgr.deduct_quota(user, text_length, session)
+    
+    return {
+        "id": job.id,
+        "status": "pending",
+        "progress": 0.0,
+        "created_at": job.created_at,
+    }
+
+
+@app.websocket("/ws/synthesize-ssml")
+async def websocket_synthesize_ssml(
+    websocket: WebSocket,
+    voice_id: str,
+    user: User = Depends(get_current_user),
+):
+    """
+    WebSocket endpoint for streaming SSML synthesis.
+    
+    Client sends SSML document, receives audio chunks in real-time.
+    """
+    await websocket.accept()
+    
+    try:
+        # Receive SSML from client
+        data = await websocket.receive_json()
+        ssml = data.get("ssml", "")
+        
+        if not ssml:
+            await websocket.send_json({
+                "type": "error",
+                "data": "Missing SSML content",
+            })
+            await websocket.close()
+            return
+        
+        # Validate SSML
+        from app.services.ssml import SSMLParser
+        
+        parser = SSMLParser()
+        try:
+            segments = parser.parse(ssml)
+        except Exception as e:
+            await websocket.send_json({
+                "type": "error",
+                "data": f"Invalid SSML: {str(e)}",
+            })
+            await websocket.close()
+            return
+        
+        # Get voice
+        from app.core.database import SessionLocal
+        session = SessionLocal()
+        
+        voice = session.query(Voice).filter(Voice.id == voice_id).first()
+        if not voice:
+            await websocket.send_json({
+                "type": "error",
+                "data": "Voice not found",
+            })
+            await websocket.close()
+            return
+        
+        # Synthesize SSML
+        tts_engine = get_tts_engine()
+        voice_embedding = None
+        
+        if voice.speaker_embedding:
+            import pickle
+            voice_embedding = pickle.loads(voice.speaker_embedding)
+        
+        # Synthesize SSML (combined audio)
+        audio, sr = tts_engine.synthesize_ssml(
+            ssml,
+            voice_embedding=voice_embedding,
+            language="en",
+        )
+        
+        # Stream audio chunks
+        streaming_manager = StreamingTTSManager()
+        await streaming_manager.stream_audio_chunks(
+            audio,
+            sr,
+            websocket,
+        )
+        
+        session.close()
+    except Exception as e:
+        logger.error(f"WebSocket SSML synthesis error: {e}")
+        try:
+            await websocket.send_json({
+                "type":  "error",
+                "data": str(e),
+            })
+        except:
+            pass
 
 
 # ============ Voice Endpoints ============
