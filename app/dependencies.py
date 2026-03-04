@@ -132,3 +132,7 @@ async def get_admin_user(
             detail="Admin access required",
         )
     return user
+
+
+# Alias for admin verification (used in admin and analytics routes)
+verify_admin = get_admin_user

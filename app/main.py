@@ -25,6 +25,7 @@ from app.services.security import get_security_manager, TokenResponse
 from app.tasks.synthesis import synthesize_text_task, encode_voice_samples_task
 from app.middleware import setup_middlewares
 from app.dependencies import get_current_user, get_current_user_optional
+from app.routes import admin, analytics
 
 # Setup
 setup_logging()
@@ -50,6 +51,10 @@ app.add_middleware(
 
 # Setup security, rate limiting, and observability middleware
 setup_middlewares(app)
+
+# Include routers for organized endpoints
+app.include_router(admin.router)
+app.include_router(analytics.router)
 
 
 # ============ Startup & Shutdown ============
