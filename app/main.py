@@ -1040,6 +1040,195 @@ async def clone_voice(
     return cloned_voice
 
 
+# ============ Voice Marketplace Endpoints ============
+
+@app.post("/voices/{voice_id}/contribute")
+async def contribute_voice_to_marketplace(
+    voice_id: str,
+    consent: bool,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """
+    Contribute a voice to the marketplace for model training.
+    
+    Users who contribute voices get 2 months of free premium access.
+    
+    Args:
+        voice_id: Voice to contribute
+        consent: User grants consent to use voice for training
+    """
+    if not consent:
+        raise HTTPException(
+            status_code=400,
+            detail="Consent required to contribute voice",
+        )
+    
+    # Get voice
+    voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    if not voice:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    
+    if voice.owner_id != user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Can only contribute your own voices",
+        )
+    
+    # Grant free trial
+    from app.services.marketplace import get_marketplace_manager
+    
+    marketplace = get_marketplace_manager(session)
+    grant = await marketplace.grant_voice_contribution_reward(user, voice)
+    
+    return {
+        "status": "contributed",
+        "voice_id": voice_id,
+        "message": "Voice contributed to marketplace!",
+        "reward": {
+            "free_period_days": 60,
+            "bonus_characters": marketplace.INITIAL_VOICE_DONATION_QUOTA,
+            "free_period_end": grant.end_date,
+        },
+    }
+
+
+@app.post("/voices/{contribution_id}/withdraw")
+async def withdraw_voice_contribution(
+    contribution_id: str,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """
+    Withdraw a voice contribution from the marketplace.
+    
+    Note: Voices already used in training can't be removed from trained models,
+    but won't be used in future training runs.
+    """
+    from app.models.db import VoiceContribution
+    from app.services.marketplace import get_marketplace_manager
+    
+    contribution = session.query(VoiceContribution).filter(
+        VoiceContribution.id == contribution_id,
+    ).first()
+    
+    if not contribution:
+        raise HTTPException(status_code=404, detail="Contribution not found")
+    
+    if contribution.user_id != user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Can only withdraw your own contributions",
+        )
+    
+    marketplace = get_marketplace_manager(session)
+    await marketplace.withdraw_voice_contribution(contribution_id)
+    
+    return {
+        "status": "withdrawn",
+        "contribution_id": contribution_id,
+        "message": "Voice contribution withdrawn from marketplace",
+    }
+
+
+@app.get("/me/voice-contributions")
+async def get_my_voice_contributions(
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Get all voices current user has contributed to marketplace."""
+    from app.models.db import VoiceContribution
+    from app.services.marketplace import get_marketplace_manager
+    
+    marketplace = get_marketplace_manager(session)
+    contributions = await marketplace.get_user_voice_contributions(user)
+    
+    result = []
+    for contrib in contributions:
+        voice = session.query(Voice).filter(Voice.id == contrib.voice_id).first()
+        stats = await marketplace.get_voice_usage_stats(contrib.voice_id)
+        
+        result.append({
+            "contribution_id": contrib.id,
+            "voice_id": contrib.voice_id,
+            "voice_name": contrib.voice_name,
+            "status": contrib.status,
+            "consent_granted": contrib.consent_granted,
+            "times_used_in_training": contrib.times_used_in_training,
+            "times_synthesized": contrib.times_synthesized,
+            "usage_stats": stats,
+            "created_at": contrib.created_at,
+            "has_free_period": contrib.free_period_awarded,
+        })
+    
+    return {
+        "contributions": result,
+        "total": len(result),
+    }
+
+
+@app.get("/me/free-trial")
+async def get_my_free_trial_status(
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Get current user's free trial status and remaining quota."""
+    from app.services.marketplace import get_marketplace_manager
+    
+    marketplace = get_marketplace_manager(session)
+    grant = await marketplace.get_active_free_period(user)
+    
+    if not grant:
+        return {
+            "has_active_trial": False,
+            "message": "No active free trial",
+        }
+    
+    now = datetime.datetime.utcnow()
+    days_remaining = (grant.end_date - now).days
+    
+    # Get bonus quota remaining
+    is_in_trial, bonus_remaining = await marketplace.check_and_apply_free_period_quota(
+        user,
+        0,  # Just checking
+    )
+    
+    return {
+        "has_active_trial": True,
+        "start_date": grant.start_date,
+        "end_date": grant.end_date,
+        "days_remaining": days_remaining,
+        "grant_reason": grant.grant_reason,
+        "bonus_monthly_quota": grant.bonus_monthly_quota,
+        "bonus_quota_remaining": bonus_remaining,
+        "related_voice_id": grant.related_voice_id,
+    }
+
+
+@app.get("/marketplace/stats")
+async def get_marketplace_stats(
+    session: Session = Depends(get_session),
+):
+    """Get overall marketplace statistics."""
+    from app.services.marketplace import get_marketplace_manager
+    
+    marketplace = get_marketplace_manager(session)
+    stats = await marketplace.get_marketplace_stats()
+    
+    return {
+        "marketplace": stats,
+        "opportunity": {
+            "message": "Help us improve! Contribute your voice and get 2 months free access.",
+            "how_it_works": [
+                "Create or clone a voice in Ghost Voice TTS",
+                "Opt-in to contribute to our training dataset",
+                "Receive 60 days free premium access",
+                "Earn points as your voice helps train better models",
+            ],
+        },
+    }
+
+
 # ============ Streaming Endpoints ============
 
 @app.get("/synthesis/{job_id}/stream")
