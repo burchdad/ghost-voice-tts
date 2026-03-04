@@ -1,0 +1,64 @@
+# Core Framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+python-multipart==0.0.6
+python-dotenv==1.0.0
+
+# Database
+sqlalchemy==2.0.23
+alembic==1.12.1
+psycopg2-binary==2.9.9
+sqlmodel==0.0.14
+
+# Cache & Queue
+redis==5.0.1
+celery==5.3.4
+kombu==5.3.4
+
+# TTS & Audio
+torch==2.1.1
+torchaudio==2.1.1
+tortoise-tts==0.2.0
+scipy==1.11.4
+librosa==0.10.0
+soundfile==0.12.1
+numpy==1.24.3
+
+# Voice Cloning & Embeddings
+resemblyzer>=0.1.1.dev0
+pyannote-audio==3.0.1
+huggingface-hub==0.19.4
+transformers==4.35.2
+
+# Monitoring & Logging
+prometheus-client==0.18.0
+structlog==23.2.0
+loguru==0.7.2
+
+# AWS & Storage
+boto3==1.29.7
+botocore==1.32.7
+
+# Utilities
+httpx==0.25.1
+aiofiles==23.2.1
+click==8.1.7
+typer==0.9.0
+
+# API Utilities
+annotated-types==0.5.0
+typing-extensions==4.8.0
+
+# Development & Testing
+pytest==7.4.3
+pytest-asyncio==0.21.1
+pytest-cov==4.1.0
+black==23.12.0
+ruff==0.1.8
+mypy==1.7.1
+
+# Documentation
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4

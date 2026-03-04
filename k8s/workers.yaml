@@ -1,0 +1,204 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker-synthesis
+  namespace: ghost-voice-tts
+  labels:
+    app: celery
+    component: synthesis-worker
+spec:
+  replicas: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: celery
+      component: synthesis-worker
+  template:
+    metadata:
+      labels:
+        app: celery
+        component: synthesis-worker
+    spec:
+      nodeSelector:
+        gpu: "true"
+      restartPolicy: Always
+      containers:
+      - name: worker
+        image: ghost-voice-tts:latest
+        imagePullPolicy: Always
+        command:
+          - celery
+          - -A
+          - app.core.celery
+          - worker
+          - -Q
+          - synthesis
+          - -l
+          - info
+          - -c
+          - "2"
+          - --time-limit=1800
+          - --soft-time-limit=1700
+        envFrom:
+        - configMapRef:
+            name: tts-config
+        - secretRef:
+            name: tts-secrets
+        env:
+        - name: TTS_DEVICE
+          value: "cuda"
+        resources:
+          requests:
+            memory: "6Gi"
+            cpu: "2"
+            nvidia.com/gpu: "1"
+          limits:
+            memory: "12Gi"
+            cpu: "4"
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: models
+          mountPath: /app/models
+        - name: uploads
+          mountPath: /app/uploads
+      volumes:
+      - name: models
+        emptyDir: {}
+      - name: uploads
+        emptyDir: {}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: celery-worker-voice-cloning
+  namespace: ghost-voice-tts
+  labels:
+    app: celery
+    component: voice-cloning-worker
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: celery
+      component: voice-cloning-worker
+  template:
+    metadata:
+      labels:
+        app: celery
+        component: voice-cloning-worker
+    spec:
+      nodeSelector:
+        gpu: "true"
+      restartPolicy: Always
+      containers:
+      - name: worker
+        image: ghost-voice-tts:latest
+        imagePullPolicy: Always
+        command:
+          - celery
+          - -A
+          - app.core.celery
+          - worker
+          - -Q
+          - voice_cloning
+          - -l
+          - info
+          - -c
+          - "2"
+        envFrom:
+        - configMapRef:
+            name: tts-config
+        - secretRef:
+            name: tts-secrets
+        env:
+        - name: TTS_DEVICE
+          value: "cuda"
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+            nvidia.com/gpu: "1"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: models
+          mountPath: /app/models
+        - name: uploads
+          mountPath: /app/uploads
+      volumes:
+      - name: models
+        emptyDir: {}
+      - name: uploads
+        emptyDir: {}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flower
+  namespace: ghost-voice-tts
+  labels:
+    app: flower
+    component: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: flower
+  template:
+    metadata:
+      labels:
+        app: flower
+    spec:
+      containers:
+      - name: flower
+        image: ghost-voice-tts:latest
+        imagePullPolicy: Always
+        command:
+          - celery
+          - -A
+          - app.core.celery
+          - flower
+          - --port=5555
+        ports:
+        - name: http
+          containerPort: 5555
+        envFrom:
+        - secretRef:
+            name: tts-secrets
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: flower
+  namespace: ghost-voice-tts
+  labels:
+    app: flower
+spec:
+  type: ClusterIP
+  ports:
+  - name: http
+    port: 5555
+    targetPort: 5555
+  selector:
+    app: flower
