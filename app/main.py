@@ -146,6 +146,59 @@ async def register_user(
     return user
 
 
+@app.get("/me/quota")
+async def get_my_quota(
+    authorization: str = Header(None),
+    session: Session = Depends(get_session),
+):
+    """Get current user's quota information."""
+    
+    user = session.query(User).filter(User.is_active == True).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    from app.services.quota import get_quota_manager
+    quota_mgr = get_quota_manager()
+    quota_info = quota_mgr.get_quota_info(user)
+    
+    return {
+        "user_id": user.id,
+        "is_premium": user.is_premium,
+        **quota_info,
+    }
+
+
+@app.post("/quota/check")
+async def check_quota(
+    text_length: int,
+    authorization: str = Header(None),
+    session: Session = Depends(get_session),
+):
+    """
+    Check if user can synthesize text of given length.
+    
+    Useful for client-side pre-checks before synthesis.
+    """
+    
+    if text_length <= 0 or text_length > 5000:
+        raise HTTPException(status_code=400, detail="Invalid text length")
+    
+    user = session.query(User).filter(User.is_active == True).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    from app.services.quota import get_quota_manager
+    quota_mgr = get_quota_manager()
+    can_proceed, remaining = quota_mgr.check_monthly_quota(user, text_length)
+    
+    return {
+        "can_synthesize": can_proceed,
+        "requested_characters": text_length,
+        "remaining_quota": remaining,
+        "quota_info": quota_mgr.get_quota_info(user),
+    }
+
+
 # ============ Synthesis Endpoints ============
 
 @app.post("/synthesize", response_model=SynthesisResponse)
@@ -178,6 +231,17 @@ async def synthesize(
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
     
+    # Check quota
+    from app.services.quota import get_quota_manager
+    quota_mgr = get_quota_manager()
+    can_proceed, remaining = quota_mgr.check_monthly_quota(user, len(request.text))
+    
+    if not can_proceed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Quota exceeded. Remaining: {remaining} characters for this month"
+        )
+    
     # Create synthesis job
     job = SynthesisJob(
         user_id=user.id,
@@ -195,12 +259,23 @@ async def synthesize(
     session.commit()
     session.refresh(job)
     
+    # Deduct quota
+    quota_mgr.deduct_quota(user, len(request.text), session)
+    
     # Get voice embedding from cache
     cache = get_redis_cache()
     voice_embedding_bytes = cache.get_embedding(request.voice_id)
     
     # Queue synthesis task
-    cache_key = f"synthesis:{job.id}"
+    from app.utils.cache_keys import CacheKeyGenerator
+    cache_key = CacheKeyGenerator.generate_synthesis_key(
+        text=request.text,
+        voice_id=request.voice_id,
+        language=request.language,
+        style=request.style,
+        speed=request.speed,
+        pitch=request.pitch,
+    )
     
     task = synthesize_text_task.apply_async(
         kwargs={
@@ -248,6 +323,113 @@ async def get_synthesis_status(
         completed_at=job.completed_at,
         inference_time_ms=job.inference_time_ms,
     )
+
+
+@app.post("/synthesize-batch")
+async def synthesize_batch(
+    voice_id: str,
+    texts: list[str],
+    language: str = "en",
+    authorization: str = Header(None),
+    session: Session = Depends(get_session),
+):
+    """
+    Batch synthesize multiple texts with same voice.
+    
+    Request:
+    POST /synthesize-batch
+    {
+        "voice_id": "voice-123",
+        "texts": [
+            "Hello, how are you?",
+            "This is great!",
+            "See you soon."
+        ],
+        "language": "en"
+    }
+    """
+    
+    # Validate input
+    if not texts or len(texts) == 0:
+        raise HTTPException(status_code=400, detail="texts list cannot be empty")
+    
+    if len(texts) > 100:
+        raise HTTPException(status_code=400, detail="Maximum 100 texts per batch")
+    
+    max_chars = sum(len(t) for t in texts)
+    if max_chars > 50000:
+        raise HTTPException(status_code=400, detail="Batch too large (max 50k characters)")
+    
+    # Get user and verify
+    user = session.query(User).filter(User.is_active == True).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    # Verify voice exists
+    voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    if not voice:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    
+    # Check quota
+    from app.services.quota import get_quota_manager
+    quota_mgr = get_quota_manager()
+    can_proceed, remaining = quota_mgr.check_monthly_quota(user, max_chars)
+    if not can_proceed:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Quota exceeded. Remaining: {remaining} characters"
+        )
+    
+    # Create batch job
+    batch_id = str(uuid.uuid4())
+    jobs = []
+    
+    cache = get_redis_cache()
+    voice_embedding_bytes = cache.get_embedding(voice_id)
+    
+    for text in texts:
+        job = SynthesisJob(
+            user_id=user.id,
+            voice_id=voice_id,
+            text=text,
+            text_hash=str(hash(text)),
+            language=language,
+            style="normal",
+            speed=1.0,
+            pitch=1.0,
+            status="pending",
+        )
+        session.add(job)
+        jobs.append(job)
+    
+    session.commit()
+    
+    # Queue all jobs
+    for job in jobs:
+        synthesize_text_task.apply_async(
+            kwargs={
+                "job_id": job.id,
+                "text": job.text,
+                "voice_id": voice_id,
+                "voice_embedding_bytes": voice_embedding_bytes or b"",
+                "language": language,
+            },
+            task_id=f"synthesis-{job.id}",
+        )
+    
+    # Deduct quota
+    quota_mgr.deduct_quota(user, max_chars, session)
+    
+    logger.info(f"Batch synthesis created: {batch_id} with {len(jobs)} items")
+    
+    return {
+        "batch_id": batch_id,
+        "total_items": len(jobs),
+        "job_ids": [job.id for job in jobs],
+        "status": "queued",
+        "total_characters": max_chars,
+        "message": "Batch synthesis started. Poll individual jobs for status."
+    }
 
 
 # ============ Voice Endpoints ============
@@ -308,7 +490,7 @@ async def upload_voice_sample(
     authorization: str = Header(None),
     session: Session = Depends(get_session),
 ):
-    """Upload an audio sample for voice cloning."""
+    """Upload an audio sample for voice cloning with validation."""
     
     voice = session.query(Voice).filter(Voice.id == voice_id).first()
     if not voice:
@@ -322,14 +504,45 @@ async def upload_voice_sample(
     # Read audio file
     content = await file.read()
     
-    # In production: validate audio, upload to S3, process
-    logger.info(f"Voice sample uploaded for voice {voice_id}: {file.filename}")
+    if len(content) > 100 * 1024 * 1024:  # 100MB max
+        raise HTTPException(status_code=413, detail="File too large (max 100MB)")
     
-    return {
-        "status": "received",
-        "message": "Voice sample received. Processing...",
-        "voice_id": voice_id,
-    }
+    # Validate audio
+    try:
+        from app.services.audio_validation import validate_audio, AudioValidationError
+        
+        audio, sr, metadata = validate_audio(content, file.filename)
+        
+        logger.info(
+            f"Voice sample validated for {voice_id}: "
+            f"SNR={metadata['snr']:.1f}dB, "
+            f"Loudness={metadata['loudness']:.1f}LUFS"
+        )
+        
+        # TODO: In production, upload to S3 and queue voice encoding task
+        # from app.tasks.synthesis import encode_voice_samples_task
+        # encode_voice_samples_task.apply_async(kwargs={...})
+        
+        return {
+            "status": "received",
+            "message": "Voice sample validated and queued for processing",
+            "voice_id": voice_id,
+            "filename": file.filename,
+            "metadata": {
+                "duration_seconds": len(audio) / sr,
+                "sample_rate": sr,
+                "loudness_lufs": metadata['loudness'],
+                "snr_db": metadata['snr'],
+            }
+        }
+    
+    except AudioValidationError as e:
+        logger.warning(f"Audio validation failed for {voice_id}: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    except Exception as e:
+        logger.error(f"Audio processing failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Audio processing failed")
 
 
 @app.get("/voices")
