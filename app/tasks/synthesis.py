@@ -6,8 +6,11 @@ import time
 from app.core.celery import celery_app
 from app.services.tts_engine import get_tts_engine
 from app.services.cache import get_redis_cache
+from app.services.streaming import StreamingTTSManager
+from app.utils.cache_keys import CacheKeyGenerator
 from app.core.database import engine
 from app.models.db import SynthesisJob
+from app.core.metrics import MetricsCollector
 from sqlmodel import Session, select
 
 logger = logging.getLogger(__name__)
@@ -64,6 +67,7 @@ def synthesize_text_task(
             cached_audio = cache.get_audio(cache_key)
             if cached_audio:
                 logger.info(f"Using cached audio for job {job_id}")
+                MetricsCollector.record_cache_hit("audio")
                 with Session(engine) as session:
                     job = session.exec(select(SynthesisJob).where(SynthesisJob.id == job_id)).first()
                     if job:
@@ -89,6 +93,10 @@ def synthesize_text_task(
         voice_embedding = None
         if voice_embedding_bytes:
             voice_embedding = np.frombuffer(voice_embedding_bytes, dtype=np.float32)
+        
+        # Check cache miss
+        if cache_key:
+            MetricsCollector.record_cache_miss("audio")
         
         # Get TTS engine and synthesize
         engine_instance = get_tts_engine()
@@ -133,6 +141,14 @@ def synthesize_text_task(
         
         total_time = (time.time() - start_time) * 1000
         logger.info(f"Synthesis completed for job {job_id} in {total_time:.2f}ms")
+        
+        # Record metrics
+        MetricsCollector.record_synthesis_complete(
+            duration=total_time / 1000.0,
+            success=True,
+            num_characters=len(text),
+        )
+        MetricsCollector.record_inference_time(inference_time)
         
         return {
             "job_id": job_id,

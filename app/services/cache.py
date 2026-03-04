@@ -5,6 +5,7 @@ from typing import Optional, Any
 from datetime import timedelta
 
 from app.core.config import get_settings
+from app.utils.cache_keys import CacheKeyGenerator
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -56,11 +57,13 @@ class RedisCache:
     
     def get_embedding(self, voice_id: str) -> Optional[bytes]:
         """Retrieve speaker embedding."""
-        return self.get(f"embedding:{voice_id}")
+        key = CacheKeyGenerator.generate_embedding_key(voice_id)
+        return self.get(key)
     
     def set_embedding(self, voice_id: str, embedding: bytes) -> bool:
         """Store speaker embedding with longer TTL."""
-        return self.set(f"embedding:{voice_id}", embedding, ttl=86400)  # 24 hours
+        key = CacheKeyGenerator.generate_embedding_key(voice_id)
+        return self.set(key, embedding, ttl=86400)  # 24 hours
     
     def get_job_status(self, job_id: str) -> Optional[dict]:
         """Get synthesis job status from cache."""

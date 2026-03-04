@@ -76,6 +76,25 @@ class TTSEngine:
         except Exception as e:
             logger.error(f"Failed to load speaker encoder: {e}")
     
+    def warm_load(self):
+        """Warm-load models and keep them in memory for fast inference."""
+        if not self._initialized:
+            self.initialize()
+        
+        try:
+            logger.info("Starting model warm-load...")
+            
+            # Generate a dummy synthesis to load model into GPU memory
+            dummy_text = "This is a warm-up test."
+            logger.info("Generating warm-up synthesis...")
+            
+            audio, sr = self.synthesize(dummy_text)
+            
+            logger.info(f"Warm-load complete. Model resident in {self.device} memory. "
+                       f"Generated {len(audio)} samples at {sr}Hz")
+        except Exception as e:
+            logger.warning(f"Warm-load failed (non-blocking): {e}")
+    
     def synthesize(
         self,
         text: str,

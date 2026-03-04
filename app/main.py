@@ -1,22 +1,26 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session
 import logging
 from datetime import datetime
 import uuid
+import json
+import numpy as np
 
 from app.core.config import get_settings
 from app.core.database import create_db_and_tables, get_session
 from app.core.logging import setup_logging
+from app.core.metrics import metrics_registry, MetricsCollector
 from app.schemas.tts import (
     SynthesisRequest, SynthesisResponse,
-    VoiceResponse, VoiceCloningRequest,
+    VoiceResponse, VoiceCloningRequest, VoiceUpdate,
     HealthResponse, UserResponse,
 )
 from app.models.db import User, Voice, SynthesisJob
 from app.services.tts_engine import get_tts_engine
 from app.services.cache import get_redis_cache
+from app.services.streaming import StreamingTTSManager
 from app.tasks.synthesis import synthesize_text_task, encode_voice_samples_task
 
 # Setup
@@ -50,12 +54,12 @@ async def startup_event():
     logger.info("Starting Ghost Voice TTS service...")
     create_db_and_tables()
     
-    # Warm up TTS engine
+    # Warm up TTS engine - keeps models loaded in memory
     if not settings.DEBUG:
         try:
             engine = get_tts_engine()
-            engine.initialize()
-            logger.info("TTS engine warmed up")
+            engine.warm_load()
+            logger.info("TTS engine warmed up and ready for low-latency inference")
         except Exception as e:
             logger.warning(f"TTS engine warmup failed: {e}")
 
@@ -98,6 +102,18 @@ async def metrics():
         "active_jobs": cache.get_counter("jobs:active"),
         "timestamp": datetime.utcnow(),
     }
+
+
+@app.get("/prometheus/metrics")
+async def prometheus_metrics():
+    """Prometheus metrics in text format."""
+    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
+    from fastapi.responses import Response
+    
+    return Response(
+        generate_latest(metrics_registry),
+        media_type=CONTENT_TYPE_LATEST,
+    )
 
 
 # ============ User Endpoints ============
@@ -318,15 +334,187 @@ async def upload_voice_sample(
 
 @app.get("/voices")
 async def list_voices(
+    skip: int = 0,
+    limit: int = 20,
+    language: str = None,
+    verified_only: bool = False,
     session: Session = Depends(get_session),
 ):
-    """List all public voices."""
+    """List all public voices with filtering options."""
     
-    voices = session.query(Voice).filter(Voice.is_public == True).all()
-    return voices
+    query = session.query(Voice).filter(Voice.is_public == True)
+    
+    if verified_only:
+        query = query.filter(Voice.is_verified == True)
+    
+    if language:
+        query = query.filter(Voice.language == language)
+    
+    # Order by quality score and creation date
+    voices = query.order_by(
+        Voice.quality_score.desc(),
+        Voice.created_at.desc()
+    ).offset(skip).limit(limit).all()
+    
+    return {
+        "total_count": query.count(),
+        "skip": skip,
+        "limit": limit,
+        "voices": voices,
+    }
 
 
-# ============ Stream Endpoint ============
+@app.get("/voices/{voice_id}/metadata")
+async def get_voice_metadata(
+    voice_id: str,
+    session: Session = Depends(get_session),
+):
+    """Get detailed voice metadata including usage statistics."""
+    
+    voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    if not voice:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    
+    if not voice.is_public:
+        raise HTTPException(status_code=403, detail="Voice is private")
+    
+    return {
+        "id": voice.id,
+        "name": voice.name,
+        "description": voice.description,
+        "gender": voice.gender,
+        "accent": voice.accent,
+        "language": voice.language,
+        "is_verified": voice.is_verified,
+        "quality_score": voice.quality_score,
+        "total_characters_synthesized": voice.total_characters_synthesized,
+        "last_used_at": voice.last_used_at,
+        "created_at": voice.created_at,
+        "updated_at": voice.updated_at,
+    }
+
+
+@app.put("/voices/{voice_id}", response_model=VoiceResponse)
+async def update_voice(
+    voice_id: str,
+    request: VoiceUpdate,
+    authorization: str = Header(None),
+    session: Session = Depends(get_session),
+):
+    """Update voice details."""
+    
+    voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    if not voice:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    
+    # Verify ownership
+    user = session.query(User).filter(User.is_active == True).first()
+    if not user or voice.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    if request.name:
+        voice.name = request.name
+    if request.description is not None:
+        voice.description = request.description
+    if request.is_public is not None:
+        voice.is_public = request.is_public
+    
+    voice.updated_at = datetime.utcnow()
+    session.add(voice)
+    session.commit()
+    session.refresh(voice)
+    
+    logger.info(f"Voice {voice_id} updated")
+    
+    return voice
+
+
+@app.delete("/voices/{voice_id}")
+async def delete_voice(
+    voice_id: str,
+    authorization: str = Header(None),
+    session: Session = Depends(get_session),
+):
+    """Delete a voice."""
+    
+    voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    if not voice:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    
+    # Verify ownership
+    user = session.query(User).filter(User.is_active == True).first()
+    if not user or voice.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+    
+    session.delete(voice)
+    session.commit()
+    
+    logger.info(f"Voice {voice_id} deleted")
+    
+    return {"status": "deleted", "voice_id": voice_id}
+
+
+@app.get("/me/voices")
+async def list_my_voices(
+    authorization: str = Header(None),
+    session: Session = Depends(get_session),
+):
+    """List voices owned by the current user."""
+    
+    user = session.query(User).filter(User.is_active == True).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    voices = session.query(Voice).filter(Voice.owner_id == user.id).all()
+    
+    return {
+        "user_id": user.id,
+        "total_voices": len(voices),
+        "voices": voices,
+    }
+
+
+@app.post("/voices/{voice_id}/clone")
+async def clone_voice(
+    voice_id: str,
+    new_name: str,
+    new_description: str = None,
+    authorization: str = Header(None),
+    session: Session = Depends(get_session),
+):
+    """Clone an existing voice as a new voice."""
+    
+    source_voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    if not source_voice:
+        raise HTTPException(status_code=404, detail="Source voice not found")
+    
+    user = session.query(User).filter(User.is_active == True).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    # Create new voice with cloned embedding
+    cloned_voice = Voice(
+        owner_id=user.id,
+        name=new_name,
+        description=new_description or f"Clone of {source_voice.name}",
+        gender=source_voice.gender,
+        accent=source_voice.accent,
+        language=source_voice.language,
+        speaker_embedding=source_voice.speaker_embedding,  # Same embedding
+        embedding_model=source_voice.embedding_model,
+        is_public=False,
+    )
+    
+    session.add(cloned_voice)
+    session.commit()
+    session.refresh(cloned_voice)
+    
+    logger.info(f"Voice {voice_id} cloned as {cloned_voice.id}")
+    
+    return cloned_voice
+
+
+# ============ Streaming Endpoints ============
 
 @app.get("/synthesis/{job_id}/stream")
 async def stream_synthesis(
@@ -348,6 +536,94 @@ async def stream_synthesis(
         "audio_url": job.audio_url,
         "duration": job.audio_duration,
     }
+
+
+@app.websocket("/ws/synthesize")
+async def websocket_synthesize(
+    websocket: WebSocket,
+    session: Session = Depends(get_session),
+):
+    """
+    WebSocket endpoint for real-time streaming synthesis.
+    
+    Client should send:
+    {
+        "text": "Hello, world!",
+        "voice_id": "voice-123",
+        "language": "en",
+        "style": "normal",
+        "speed": 1.0,
+        "pitch": 1.0
+    }
+    
+    Server streams back events with audio chunks.
+    """
+    
+    await websocket.accept()
+    streaming_manager = StreamingTTSManager()
+    
+    try:
+        while True:
+            # Receive synthesis request
+            data = await websocket.receive_text()
+            request = json.loads(data)
+            
+            # Validate required fields
+            text = request.get("text", "")
+            voice_id = request.get("voice_id", "")
+            
+            if not text or not voice_id:
+                await websocket.send_json({
+                    "type": "error",
+                    "error": "Missing 'text' or 'voice_id'",
+                })
+                continue
+            
+            # Verify voice exists
+            voice = session.query(Voice).filter(Voice.id == voice_id).first()
+            if not voice:
+                await websocket.send_json({
+                    "type": "error",
+                    "error": "Voice not found",
+                })
+                continue
+            
+            # Get voice embedding from cache
+            cache = get_redis_cache()
+            voice_embedding_bytes = cache.get_embedding(voice_id)
+            voice_embedding = None
+            
+            if voice_embedding_bytes:
+                voice_embedding = np.frombuffer(voice_embedding_bytes, dtype=np.float32)
+            
+            # Stream synthesis
+            async for event in streaming_manager.synthesize_and_stream(
+                text=text,
+                voice_id=voice_id,
+                voice_embedding=voice_embedding,
+                language=request.get("language", "en"),
+                style=request.get("style", "normal"),
+                speed=float(request.get("speed", 1.0)),
+                pitch=float(request.get("pitch", 1.0)),
+            ):
+                await websocket.send_json(event)
+    
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}", exc_info=True)
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "error": str(e),
+            })
+        except:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
 
 
 if __name__ == "__main__":
