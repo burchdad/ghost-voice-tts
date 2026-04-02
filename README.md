@@ -125,6 +125,16 @@ Node capability and provider status are exposed through:
 - `GET /tts/sessions/{session_id}`
 - `DELETE /tts/sessions/{session_id}`
 
+### 6.1) Prosody Learning Observability Endpoints
+
+Admin-only observability for online prosody learning state:
+- `GET /admin/debug/prosody-learning`
+  - Safe bounded snapshot with masked session identifiers
+  - Optional `include_sessions` toggle and `limit` control
+- `GET /admin/debug/prosody-learning/aggregate`
+  - Strict aggregate-only view for production posture
+  - Returns only summary counts and averaged metrics (no row-level session/provider entries)
+
 ### 7) Edge/Cloud Hybrid Profile
 
 Deployment profile is configurable via:
