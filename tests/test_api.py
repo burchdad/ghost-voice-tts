@@ -1,6 +1,8 @@
 import pytest
 import base64
+import io
 import numpy as np
+import soundfile as sf
 from fastapi.testclient import TestClient
 from sqlmodel import Session, create_engine, SQLModel, select
 from sqlmodel.pool import StaticPool
@@ -249,6 +251,112 @@ class TestEnhanceEndpoint:
             },
         )
         assert response.status_code == 422
+
+
+class TestEnhanceAudioEndpoint:
+    """Test uploaded-audio enhancement endpoint."""
+
+    def test_enhance_audio_changes_output(self, client: TestClient):
+        """Test /enhance-audio decodes, transforms, and returns modified WAV."""
+        sr = 24000
+        t = np.linspace(0, 0.5, int(sr * 0.5), endpoint=False, dtype=np.float32)
+        # A non-silent tone makes transform verification meaningful.
+        tone = (0.15 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+        wav_buf = io.BytesIO()
+        sf.write(wav_buf, tone, sr, format="WAV")
+        input_bytes = wav_buf.getvalue()
+
+        response = client.post(
+            "/enhance-audio",
+            files={"file": ("input.wav", input_bytes, "audio/wav")},
+            data={
+                "speed": "1.15",
+                "pitch": "1.10",
+                "gain_db": "2.0",
+                "compression_amount": "1.25",
+                "ensure_audible_change": "true",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["processing_applied"] is True
+        assert data["hash_changed"] is True
+        assert data["input_size_bytes"] == len(input_bytes)
+        assert data["output_size_bytes"] > 44
+        assert data["input_hash_sha256"] != data["output_hash_sha256"]
+
+        out_bytes = base64.b64decode(data["audioBase64"])
+        assert out_bytes[:4] == b"RIFF"
+
+    def test_enhance_audio_rejects_empty_upload(self, client: TestClient):
+        """Test /enhance-audio rejects empty file payloads."""
+        response = client.post(
+            "/enhance-audio",
+            files={"file": ("empty.wav", b"", "audio/wav")},
+        )
+        assert response.status_code == 400
+
+
+class TestGhostIntelligencePassEndpoint:
+    """Test one-click ghost pass endpoint for both text and audio inputs."""
+
+    def test_ghost_pass_text_generation(self, client: TestClient, monkeypatch):
+        """Text form input should synthesize and return text_generation source."""
+        class _DummyEngine:
+            def synthesize(self, **kwargs):
+                return np.zeros(2400, dtype=np.float32), 24000
+
+        monkeypatch.setattr("app.main.get_tts_engine", lambda: _DummyEngine())
+
+        response = client.post(
+            "/generate-ghost-intelligence-pass",
+            data={
+                "text": "Make this sound cinematic",
+                "emotion": "confident",
+                "emotion_curve": "arc",
+                "mode": "balanced",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["source"] == "text_generation"
+        assert data["processing_applied"] is True
+        assert "deltas" in data
+        assert isinstance(data["audioBase64"], str)
+
+    def test_ghost_pass_audio_refinement(self, client: TestClient):
+        """Audio upload should refine and return audio_refinement source."""
+        sr = 24000
+        t = np.linspace(0, 0.4, int(sr * 0.4), endpoint=False, dtype=np.float32)
+        tone = (0.15 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+        wav_buf = io.BytesIO()
+        sf.write(wav_buf, tone, sr, format="WAV")
+        input_bytes = wav_buf.getvalue()
+
+        response = client.post(
+            "/ghost-intelligence-pass",
+            files={"file": ("sample.wav", input_bytes, "audio/wav")},
+            data={
+                "speed": "1.15",
+                "pitch": "1.10",
+                "gain_db": "2.0",
+                "compression_amount": "1.25",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["source"] == "audio_refinement"
+        assert data["processing_applied"] is True
+        assert data["hash_changed"] is True
+        assert data["input_size_bytes"] == len(input_bytes)
+
+    def test_ghost_pass_requires_text_or_file(self, client: TestClient):
+        """Missing both text and file should be rejected."""
+        response = client.post("/ghost-intelligence-pass", data={})
+        assert response.status_code == 400
 
 
 if __name__ == "__main__":

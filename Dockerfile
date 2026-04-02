@@ -6,11 +6,21 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements-railway.txt ./
-RUN pip install --upgrade pip setuptools wheel && pip install -r requirements-railway.txt
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libsndfile1 \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-COPY railway_app.py ./railway_app.py
+COPY requirements.txt ./
+RUN pip install --upgrade pip setuptools wheel && pip install -r requirements.txt
+
+COPY app ./app
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
+
+RUN mkdir -p uploads/audio uploads/voice_samples
 
 EXPOSE 8000
 
-CMD ["python", "railway_app.py"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

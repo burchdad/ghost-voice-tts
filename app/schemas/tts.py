@@ -332,6 +332,34 @@ class EnhanceResponse(BaseModel):
     deltas: Dict[str, float | str | bool | None]
 
 
+class AudioEnhanceResponse(BaseModel):
+    audioBase64: str
+    input_format: str
+    output_format: str = "wav"
+    input_size_bytes: int
+    output_size_bytes: int
+    input_hash_sha256: str
+    output_hash_sha256: str
+    hash_changed: bool
+    processing_applied: bool
+    decoder_used: str
+
+
+class GhostIntelligencePassResponse(BaseModel):
+    audioBase64: str
+    source: str
+    processing_applied: bool
+    deltas: Optional[Dict[str, float | str | bool | None]] = None
+    input_format: Optional[str] = None
+    output_format: Optional[str] = None
+    input_size_bytes: Optional[int] = None
+    output_size_bytes: Optional[int] = None
+    input_hash_sha256: Optional[str] = None
+    output_hash_sha256: Optional[str] = None
+    hash_changed: Optional[bool] = None
+    decoder_used: Optional[str] = None
+
+
 # ============ SSML Synthesis Schemas ============
 
 class SSMLSynthesisRequest(BaseModel):

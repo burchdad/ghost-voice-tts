@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, WebSocket, WebSocketDisconnect, status, Request
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Header, WebSocket, WebSocketDisconnect, status, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -9,11 +9,14 @@ import uuid
 import json
 import base64
 import io
+import hashlib
 import numpy as np
 import time
 import os
 import pickle
+import tempfile
 import soundfile as sf
+import librosa
 from contextlib import asynccontextmanager
 import threading
 
@@ -26,6 +29,10 @@ from app.schemas.tts import (
     VoiceResponse, VoiceCloningRequest, VoiceUpdate,
     HealthResponse, UserResponse, SSMLSynthesisRequest,
     SynthesisModeEnum, EnhanceRequest, EnhanceResponse,
+    AudioEnhanceResponse,
+    GhostIntelligencePassResponse,
+    StyleEnum,
+    EmotionCurveEnum,
 )
 from app.models.db import User, Voice, SynthesisJob, Subscription, VoiceSample
 from app.services.tts_engine import get_tts_engine
@@ -203,6 +210,68 @@ def _compute_enhance_deltas(request: EnhanceRequest) -> dict[str, float | str | 
         "curve_changed": base_curve != resolved_curve,
         "auto_template_confidence": round(auto_template_confidence, 6),
     }
+
+
+def _decode_uploaded_audio(content: bytes, filename: str | None) -> tuple[np.ndarray, int, str, str]:
+    """Decode uploaded audio into mono float32 waveform using robust fallbacks."""
+    extension = os.path.splitext(filename or "upload.bin")[1].lower().lstrip(".") or "unknown"
+    temp_suffix = os.path.splitext(filename or "upload.bin")[1] or ".bin"
+
+    with tempfile.NamedTemporaryFile(suffix=temp_suffix, delete=False) as tmp:
+        tmp.write(content)
+        temp_path = tmp.name
+
+    try:
+        try:
+            audio, sample_rate = sf.read(temp_path, dtype="float32", always_2d=False)
+            decoder_used = "soundfile"
+        except Exception:
+            audio, sample_rate = librosa.load(temp_path, sr=None, mono=False)
+            decoder_used = "librosa"
+
+        if isinstance(audio, np.ndarray) and audio.ndim > 1:
+            # Normalize to mono to keep downstream transforms predictable.
+            if audio.shape[0] <= audio.shape[1]:
+                audio = np.mean(audio, axis=0)
+            else:
+                audio = np.mean(audio, axis=1)
+
+        return np.asarray(audio, dtype=np.float32), int(sample_rate), extension, decoder_used
+    finally:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+
+
+def _apply_real_audio_enhancement(
+    audio: np.ndarray,
+    sample_rate: int,
+    *,
+    speed: float,
+    pitch: float,
+    gain_db: float,
+    compression_amount: float,
+) -> np.ndarray:
+    """Apply audible, deterministic waveform transforms."""
+    processed = np.asarray(audio, dtype=np.float32)
+    if processed.size == 0:
+        raise ValueError("Audio buffer is empty")
+
+    if pitch != 1.0:
+        n_steps = float(12.0 * np.log2(max(pitch, 1e-3)))
+        processed = librosa.effects.pitch_shift(processed, sr=sample_rate, n_steps=n_steps)
+
+    if speed != 1.0:
+        processed = librosa.effects.time_stretch(processed, rate=max(speed, 0.1))
+
+    if gain_db != 0.0:
+        processed = processed * float(10.0 ** (gain_db / 20.0))
+
+    if compression_amount > 1.0:
+        processed = np.tanh(processed * compression_amount) / np.tanh(compression_amount)
+
+    return np.clip(processed, -1.0, 1.0).astype(np.float32)
 
 
 @asynccontextmanager
@@ -819,6 +888,296 @@ async def enhance(request: EnhanceRequest):
     audio_base64 = base64.b64encode(wav_buffer.getvalue()).decode("ascii")
 
     return EnhanceResponse(audioBase64=audio_base64, deltas=deltas)
+
+
+@app.post("/enhance-audio", response_model=AudioEnhanceResponse)
+async def enhance_audio(
+    file: UploadFile = File(...),
+    speed: float = Form(1.1),
+    pitch: float = Form(1.08),
+    gain_db: float = Form(1.5),
+    compression_amount: float = Form(1.2),
+    ensure_audible_change: bool = Form(True),
+):
+    """Decode uploaded audio, apply audible DSP, then return transformed WAV as base64."""
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
+
+    if len(content) > 50 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="File too large (max 50MB)")
+
+    try:
+        audio, sample_rate, input_format, decoder_used = _decode_uploaded_audio(content, file.filename)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Failed to decode audio. For webm/opus input, ensure ffmpeg support is available "
+                "in the runtime image."
+            ),
+        ) from exc
+
+    try:
+        transformed = _apply_real_audio_enhancement(
+            audio,
+            sample_rate,
+            speed=speed,
+            pitch=pitch,
+            gain_db=gain_db,
+            compression_amount=compression_amount,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Audio transformation failed") from exc
+
+    wav_buffer = io.BytesIO()
+    sf.write(wav_buffer, transformed, sample_rate, format="WAV")
+    output_bytes = wav_buffer.getvalue()
+
+    input_hash = hashlib.sha256(content).hexdigest()
+    output_hash = hashlib.sha256(output_bytes).hexdigest()
+    hash_changed = input_hash != output_hash
+
+    if ensure_audible_change and not hash_changed:
+        raise HTTPException(status_code=500, detail="Enhancement produced identical output")
+
+    logger.info(
+        "ENHANCEMENT APPLIED input_format=%s decoder=%s input_bytes=%d output_bytes=%d speed=%.3f pitch=%.3f gain_db=%.3f compression=%.3f hash_changed=%s",
+        input_format,
+        decoder_used,
+        len(content),
+        len(output_bytes),
+        speed,
+        pitch,
+        gain_db,
+        compression_amount,
+        hash_changed,
+    )
+
+    audio_base64 = base64.b64encode(output_bytes).decode("ascii")
+    return AudioEnhanceResponse(
+        audioBase64=audio_base64,
+        input_format=input_format,
+        output_format="wav",
+        input_size_bytes=len(content),
+        output_size_bytes=len(output_bytes),
+        input_hash_sha256=input_hash,
+        output_hash_sha256=output_hash,
+        hash_changed=hash_changed,
+        processing_applied=True,
+        decoder_used=decoder_used,
+    )
+
+
+@app.post("/ghost-intelligence-pass", response_model=GhostIntelligencePassResponse)
+async def ghost_intelligence_pass(
+    file: UploadFile | None = File(default=None),
+    text: str | None = Form(default=None),
+    language: str = Form(default="en"),
+    style: str = Form(default="normal"),
+    speed: float = Form(default=1.1),
+    pitch: float = Form(default=1.08),
+    emotion: str | None = Form(default=None),
+    secondary_emotion: str | None = Form(default=None),
+    emotion_blend: float = Form(default=0.3),
+    emotion_intensity: float = Form(default=1.0),
+    emotion_curve: str = Form(default="arc"),
+    auto_template: bool = Form(default=True),
+    mode: str = Form(default="balanced"),
+    voice_seed: int | None = Form(default=None),
+    session_id: str | None = Form(default=None),
+    ml_prosody_refinement: bool = Form(default=True),
+    phoneme_alignment: bool = Form(default=True),
+    gain_db: float = Form(default=1.5),
+    compression_amount: float = Form(default=1.2),
+    ensure_audible_change: bool = Form(default=True),
+):
+    """One-click endpoint for landing pages: generate from text or refine uploaded audio."""
+    if file is not None:
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="Uploaded audio file is empty")
+        if len(content) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="File too large (max 50MB)")
+
+        try:
+            audio, sample_rate, input_format, decoder_used = _decode_uploaded_audio(content, file.filename)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Failed to decode audio. For webm/opus input, ensure ffmpeg support is available "
+                    "in the runtime image."
+                ),
+            ) from exc
+
+        try:
+            transformed = _apply_real_audio_enhancement(
+                audio,
+                sample_rate,
+                speed=speed,
+                pitch=pitch,
+                gain_db=gain_db,
+                compression_amount=compression_amount,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="Audio transformation failed") from exc
+
+        wav_buffer = io.BytesIO()
+        sf.write(wav_buffer, transformed, sample_rate, format="WAV")
+        output_bytes = wav_buffer.getvalue()
+
+        input_hash = hashlib.sha256(content).hexdigest()
+        output_hash = hashlib.sha256(output_bytes).hexdigest()
+        hash_changed = input_hash != output_hash
+
+        if ensure_audible_change and not hash_changed:
+            raise HTTPException(status_code=500, detail="Enhancement produced identical output")
+
+        logger.info(
+            "ENHANCEMENT APPLIED source=audio_refinement input_format=%s decoder=%s input_bytes=%d output_bytes=%d speed=%.3f pitch=%.3f gain_db=%.3f compression=%.3f hash_changed=%s",
+            input_format,
+            decoder_used,
+            len(content),
+            len(output_bytes),
+            speed,
+            pitch,
+            gain_db,
+            compression_amount,
+            hash_changed,
+        )
+
+        return GhostIntelligencePassResponse(
+            audioBase64=base64.b64encode(output_bytes).decode("ascii"),
+            source="audio_refinement",
+            processing_applied=True,
+            input_format=input_format,
+            output_format="wav",
+            input_size_bytes=len(content),
+            output_size_bytes=len(output_bytes),
+            input_hash_sha256=input_hash,
+            output_hash_sha256=output_hash,
+            hash_changed=hash_changed,
+            decoder_used=decoder_used,
+        )
+
+    if not text or not text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either audio file upload or non-empty text",
+        )
+
+    try:
+        request = EnhanceRequest(
+            text=text,
+            language=language,
+            style=StyleEnum(style),
+            speed=speed,
+            pitch=pitch,
+            emotion=emotion,
+            secondary_emotion=secondary_emotion,
+            emotion_blend=emotion_blend,
+            emotion_intensity=emotion_intensity,
+            emotion_curve=EmotionCurveEnum(emotion_curve),
+            auto_template=auto_template,
+            mode=SynthesisModeEnum(mode),
+            voice_seed=voice_seed,
+            session_id=session_id,
+            ml_prosody_refinement=ml_prosody_refinement,
+            phoneme_alignment=phoneme_alignment,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid text-generation controls: {exc}") from exc
+
+    try:
+        deltas = _compute_enhance_deltas(request)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid enhancement controls: {exc}") from exc
+
+    synth_engine = get_tts_engine()
+    try:
+        audio, sample_rate = synth_engine.synthesize(
+            text=request.text,
+            speed=request.speed,
+            pitch=request.pitch,
+            style=request.style.value,
+            mode=request.mode.value,
+            voice_seed=request.voice_seed,
+            emotion=request.emotion,
+            emotion_secondary=request.secondary_emotion,
+            emotion_blend=request.emotion_blend,
+            emotion_intensity=request.emotion_intensity,
+            emotion_curve=request.emotion_curve.value,
+            prosody_template=request.prosody_template.value if request.prosody_template else None,
+            prosody_template_axes=request.prosody_template_axes,
+            auto_template=request.auto_template,
+            session_id=request.session_id,
+            ml_refinement=request.ml_prosody_refinement,
+            phoneme_alignment=request.phoneme_alignment,
+        )
+    except Exception as exc:
+        logger.error("Ghost intelligence text generation failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to synthesize enhanced audio") from exc
+
+    wav_buffer = io.BytesIO()
+    sf.write(wav_buffer, audio, sample_rate, format="WAV")
+
+    logger.info("ENHANCEMENT APPLIED source=text_generation chars=%d", len(request.text))
+    return GhostIntelligencePassResponse(
+        audioBase64=base64.b64encode(wav_buffer.getvalue()).decode("ascii"),
+        source="text_generation",
+        processing_applied=True,
+        deltas=deltas,
+        output_format="wav",
+    )
+
+
+@app.post("/generate-ghost-intelligence-pass", response_model=GhostIntelligencePassResponse)
+async def generate_ghost_intelligence_pass(
+    file: UploadFile | None = File(default=None),
+    text: str | None = Form(default=None),
+    language: str = Form(default="en"),
+    style: str = Form(default="normal"),
+    speed: float = Form(default=1.1),
+    pitch: float = Form(default=1.08),
+    emotion: str | None = Form(default=None),
+    secondary_emotion: str | None = Form(default=None),
+    emotion_blend: float = Form(default=0.3),
+    emotion_intensity: float = Form(default=1.0),
+    emotion_curve: str = Form(default="arc"),
+    auto_template: bool = Form(default=True),
+    mode: str = Form(default="balanced"),
+    voice_seed: int | None = Form(default=None),
+    session_id: str | None = Form(default=None),
+    ml_prosody_refinement: bool = Form(default=True),
+    phoneme_alignment: bool = Form(default=True),
+    gain_db: float = Form(default=1.5),
+    compression_amount: float = Form(default=1.2),
+    ensure_audible_change: bool = Form(default=True),
+):
+    """Alias route for frontend button naming."""
+    return await ghost_intelligence_pass(
+        file=file,
+        text=text,
+        language=language,
+        style=style,
+        speed=speed,
+        pitch=pitch,
+        emotion=emotion,
+        secondary_emotion=secondary_emotion,
+        emotion_blend=emotion_blend,
+        emotion_intensity=emotion_intensity,
+        emotion_curve=emotion_curve,
+        auto_template=auto_template,
+        mode=mode,
+        voice_seed=voice_seed,
+        session_id=session_id,
+        ml_prosody_refinement=ml_prosody_refinement,
+        phoneme_alignment=phoneme_alignment,
+        gain_db=gain_db,
+        compression_amount=compression_amount,
+        ensure_audible_change=ensure_audible_change,
+    )
 
 
 @app.get("/synthesis/{job_id}", response_model=SynthesisResponse)

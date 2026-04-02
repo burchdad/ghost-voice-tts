@@ -291,6 +291,47 @@ python3 -c "from ghost_voice_tts import GhostVoiceTTS; print('SDK ready!')"
 }
 ```
 
+### Uploaded Audio Enhancement Endpoint
+
+`POST /enhance-audio` accepts multipart audio (including recorder output when runtime decode support is installed), applies real waveform DSP server-side, and returns transformed WAV audio:
+
+```bash
+curl -X POST http://localhost:8000/enhance-audio \
+  -F "file=@input.wav" \
+  -F "speed=1.15" \
+  -F "pitch=1.10" \
+  -F "gain_db=2.0" \
+  -F "compression_amount=1.25" \
+  -F "ensure_audible_change=true"
+```
+
+Response includes proof fields so pass-through behavior is detectable (`hash_changed`, input/output sizes, decoder used).
+
+### One-Click Ghost Intelligence Pass (Landing Page)
+
+Use `POST /generate-ghost-intelligence-pass` from your landing page button. This endpoint supports both flows in one contract:
+
+- Text generation: send multipart form with `text` and optional prosody fields.
+- Audio refinement: send multipart form with `file` and optional DSP controls.
+
+```bash
+# Text generation flow
+curl -X POST http://localhost:8000/generate-ghost-intelligence-pass \
+  -F "text=Turn this into a high-impact sales opener" \
+  -F "emotion=confident" \
+  -F "mode=balanced"
+
+# Audio refinement flow
+curl -X POST http://localhost:8000/generate-ghost-intelligence-pass \
+  -F "file=@recording.webm" \
+  -F "speed=1.15" \
+  -F "pitch=1.10" \
+  -F "gain_db=2.0" \
+  -F "compression_amount=1.25"
+```
+
+The response has `source` set to `text_generation` or `audio_refinement` so the UI can branch playback/labels correctly.
+
 ## Python SDK
 
 The easiest way to integrate Ghost Voice TTS in your Python projects:
