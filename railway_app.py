@@ -1,3 +1,5 @@
+import os
+
 from fastapi import FastAPI, Response
 from pydantic import BaseModel
 
@@ -24,3 +26,9 @@ async def enhance(_: EnhanceRequest, response: Response) -> dict:
             "emotional_clarity": 67,
         },
     }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("railway_app:app", host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
