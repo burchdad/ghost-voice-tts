@@ -1,4 +1,6 @@
 import pytest
+import base64
+import numpy as np
 from fastapi.testclient import TestClient
 from sqlmodel import Session, create_engine, SQLModel, select
 from sqlmodel.pool import StaticPool
@@ -196,6 +198,57 @@ class TestSynthesisEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["id"] == job_id
+
+
+class TestEnhanceEndpoint:
+    """Test inline enhancement endpoint."""
+
+    def test_enhance_returns_audio_and_deltas(self, client: TestClient, monkeypatch):
+        """Test /enhance returns the expected contract with base64 WAV audio."""
+        class _DummyEngine:
+            def synthesize(self, **kwargs):
+                # 0.1s mono silence at 24kHz
+                return np.zeros(2400, dtype=np.float32), 24000
+
+        monkeypatch.setattr("app.main.get_tts_engine", lambda: _DummyEngine())
+
+        response = client.post(
+            "/enhance",
+            json={
+                "text": "Enhance this speech",
+                "emotion": "confident",
+                "emotion_intensity": 1.1,
+                "emotion_curve": "arc",
+                "auto_template": True,
+                "mode": "balanced",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "audioBase64" in data
+        assert "deltas" in data
+        assert isinstance(data["audioBase64"], str)
+        assert isinstance(data["deltas"], dict)
+
+        wav_bytes = base64.b64decode(data["audioBase64"])
+        assert len(wav_bytes) > 44
+        assert wav_bytes[:4] == b"RIFF"
+
+        assert "speed_delta" in data["deltas"]
+        assert "pitch_delta" in data["deltas"]
+        assert "curve_from" in data["deltas"]
+        assert "curve_to" in data["deltas"]
+
+    def test_enhance_rejects_empty_text(self, client: TestClient):
+        """Test /enhance validation on empty text input."""
+        response = client.post(
+            "/enhance",
+            json={
+                "text": "",
+            },
+        )
+        assert response.status_code == 422
 
 
 if __name__ == "__main__":

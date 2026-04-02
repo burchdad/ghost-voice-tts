@@ -7,6 +7,8 @@ import logging
 from datetime import datetime, timezone
 import uuid
 import json
+import base64
+import io
 import numpy as np
 import time
 import os
@@ -23,7 +25,7 @@ from app.schemas.tts import (
     SynthesisRequest, SynthesisResponse,
     VoiceResponse, VoiceCloningRequest, VoiceUpdate,
     HealthResponse, UserResponse, SSMLSynthesisRequest,
-    SynthesisModeEnum,
+    SynthesisModeEnum, EnhanceRequest, EnhanceResponse,
 )
 from app.models.db import User, Voice, SynthesisJob, Subscription, VoiceSample
 from app.services.tts_engine import get_tts_engine
@@ -134,6 +136,73 @@ def _run_inline_fallback_synthesis(
                     bg_session.commit()
         except Exception as db_error:
             logger.error(f"Failed to update fallback error status for job {job_id}: {db_error}")
+
+
+def _compute_enhance_deltas(request: EnhanceRequest) -> dict[str, float | str | bool | None]:
+    """Compute effective prosody deltas for transparency/debugging."""
+    from app.services.emotion_engine import EmotionEngine, TemplateSelector
+
+    base_curve = request.emotion_curve.value
+    resolved_curve = base_curve
+    resolved_emotion = request.emotion
+    resolved_secondary = request.secondary_emotion
+    resolved_blend = request.emotion_blend
+    resolved_intensity = request.emotion_intensity
+    template_used: str | None = None
+    auto_template_confidence = 0.0
+
+    if request.prosody_template:
+        resolved = EmotionEngine.resolve_template(
+            request.prosody_template.value,
+            **(request.prosody_template_axes or {}),
+        )
+        resolved_emotion = resolved.emotion
+        resolved_secondary = resolved.secondary_emotion
+        resolved_blend = resolved.emotion_blend
+        resolved_intensity = resolved.emotion_intensity
+        resolved_curve = resolved.emotion_curve
+        template_used = request.prosody_template.value
+    elif request.auto_template:
+        selected_name, confidence = TemplateSelector.select(request.text)
+        auto_template_confidence = confidence
+        if selected_name != "neutral":
+            resolved = EmotionEngine.resolve_template(selected_name)
+            resolved_emotion = resolved.emotion
+            resolved_secondary = resolved.secondary_emotion
+            resolved_blend = resolved.emotion_blend
+            resolved_intensity = resolved.emotion_intensity
+            resolved_curve = resolved.emotion_curve
+            template_used = selected_name
+
+    speed_multiplier = 1.0
+    pitch_multiplier = 1.0
+    if resolved_emotion:
+        profile = EmotionEngine.build_profile(
+            emotion=resolved_emotion,
+            secondary_emotion=resolved_secondary,
+            secondary_weight=resolved_blend,
+            intensity=resolved_intensity,
+        )
+        speed_multiplier = profile.speed_multiplier
+        pitch_multiplier = float(2 ** (profile.pitch_shift / 12.0))
+
+    effective_speed = request.speed * speed_multiplier
+    effective_pitch = request.pitch * pitch_multiplier
+
+    return {
+        "template_used": template_used,
+        "emotion_from": request.emotion,
+        "emotion_to": resolved_emotion,
+        "secondary_emotion_to": resolved_secondary,
+        "speed_delta": round(effective_speed - request.speed, 6),
+        "pitch_delta": round(effective_pitch - request.pitch, 6),
+        "intensity_delta": round(resolved_intensity - request.emotion_intensity, 6),
+        "blend_delta": round(resolved_blend - request.emotion_blend, 6),
+        "curve_from": base_curve,
+        "curve_to": resolved_curve,
+        "curve_changed": base_curve != resolved_curve,
+        "auto_template_confidence": round(auto_template_confidence, 6),
+    }
 
 
 @asynccontextmanager
@@ -704,6 +773,52 @@ async def synthesize(
             mode=request.mode,
             session_id=effective_session_id,
         )
+
+
+@app.post("/enhance", response_model=EnhanceResponse)
+async def enhance(request: EnhanceRequest):
+    """Render enhanced speech and return inline base64 audio with applied deltas."""
+    if len(request.text) > 5000:
+        raise HTTPException(status_code=400, detail="Text too long (max 5000 chars)")
+    if len(request.text) < 1:
+        raise HTTPException(status_code=400, detail="Text cannot be empty")
+
+    synth_engine = get_tts_engine()
+
+    try:
+        deltas = _compute_enhance_deltas(request)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid enhancement controls: {e}") from e
+
+    try:
+        audio, sample_rate = synth_engine.synthesize(
+            text=request.text,
+            speed=request.speed,
+            pitch=request.pitch,
+            style=request.style.value,
+            mode=request.mode.value,
+            voice_seed=request.voice_seed,
+            emotion=request.emotion,
+            emotion_secondary=request.secondary_emotion,
+            emotion_blend=request.emotion_blend,
+            emotion_intensity=request.emotion_intensity,
+            emotion_curve=request.emotion_curve.value,
+            prosody_template=request.prosody_template.value if request.prosody_template else None,
+            prosody_template_axes=request.prosody_template_axes,
+            auto_template=request.auto_template,
+            session_id=request.session_id,
+            ml_refinement=request.ml_prosody_refinement,
+            phoneme_alignment=request.phoneme_alignment,
+        )
+    except Exception as e:
+        logger.error("Enhance synthesis failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to synthesize enhanced audio") from e
+
+    wav_buffer = io.BytesIO()
+    sf.write(wav_buffer, audio, sample_rate, format="WAV")
+    audio_base64 = base64.b64encode(wav_buffer.getvalue()).decode("ascii")
+
+    return EnhanceResponse(audioBase64=audio_base64, deltas=deltas)
 
 
 @app.get("/synthesis/{job_id}", response_model=SynthesisResponse)

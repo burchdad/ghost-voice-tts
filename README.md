@@ -248,6 +248,16 @@ This starts:
 # Health check
 curl http://localhost:8000/health
 
+# Inline enhanced audio (base64 WAV + deltas)
+curl -X POST http://localhost:8000/enhance \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "This is an enhanced voice response.",
+    "emotion": "confident",
+    "auto_template": true,
+    "mode": "balanced"
+  }'
+
 # Create a user and get API token
 curl -X POST http://localhost:8000/auth/register \
   -H "Content-Type: application/json" \
@@ -262,6 +272,24 @@ python3 -c "from ghost_voice_tts import GhostVoiceTTS; print('SDK ready!')"
 - Alternative API Docs: `http://localhost:8000/redoc` (ReDoc)
 - Celery Tasks: `http://localhost:5555` (Flower)
 - Metrics: `http://localhost:9090` (Prometheus)
+
+### Enhance Endpoint
+
+`POST /enhance` returns inline enhanced speech audio and applied tuning deltas:
+
+```json
+{
+  "audioBase64": "<base64-encoded-wav>",
+  "deltas": {
+    "speed_delta": 0.08,
+    "pitch_delta": 0.04,
+    "intensity_delta": 0.2,
+    "curve_from": "arc",
+    "curve_to": "rise",
+    "curve_changed": true
+  }
+}
+```
 
 ## Python SDK
 

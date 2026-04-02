@@ -306,6 +306,32 @@ class BatchSynthesisResponse(BaseModel):
     results: List[SynthesisResponse]
 
 
+class EnhanceRequest(BaseModel):
+    text: str = Field(..., min_length=1, max_length=5000)
+    language: LanguageEnum = LanguageEnum.EN
+    style: StyleEnum = StyleEnum.NORMAL
+    speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    pitch: float = Field(default=1.0, ge=0.5, le=2.0)
+    emotion: Optional[str] = Field(default=None)
+    secondary_emotion: Optional[str] = Field(default=None)
+    emotion_blend: float = Field(default=0.3, ge=0.0, le=1.0)
+    emotion_intensity: float = Field(default=1.0, ge=0.0, le=2.0)
+    emotion_curve: EmotionCurveEnum = Field(default=EmotionCurveEnum.ARC)
+    prosody_template: Optional[ProsodyTemplateEnum] = Field(default=None)
+    prosody_template_axes: Optional[Dict[str, float]] = Field(default=None)
+    auto_template: bool = Field(default=False)
+    mode: SynthesisModeEnum = Field(default=SynthesisModeEnum.BALANCED)
+    voice_seed: Optional[int] = Field(default=None)
+    session_id: Optional[str] = Field(default=None)
+    ml_prosody_refinement: bool = Field(default=True)
+    phoneme_alignment: bool = Field(default=True)
+
+
+class EnhanceResponse(BaseModel):
+    audioBase64: str
+    deltas: Dict[str, float | str | bool | None]
+
+
 # ============ SSML Synthesis Schemas ============
 
 class SSMLSynthesisRequest(BaseModel):
