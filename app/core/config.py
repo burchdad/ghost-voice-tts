@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     TTS_ALLOW_SYNTH_FALLBACK: bool = True
     TTS_FALLBACK_POLICY: str = "sine"  # sine | error
     SYNTHESIS_QUEUE_POLICY: str = "inline-fallback"  # required | inline-fallback
+    TTS_WARM_ON_STARTUP: bool = True
+
+    # Startup resilience
+    STARTUP_DEGRADED_MODE: bool = True
 
     # ── Provider routing ──────────────────────────────────────────────────────
     # Which provider to use per latency tier.  Values must be provider slugs

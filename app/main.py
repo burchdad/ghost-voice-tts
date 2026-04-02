@@ -3,6 +3,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session, select
+from sqlalchemy import text
 import logging
 from datetime import datetime, timezone
 import uuid
@@ -274,27 +275,43 @@ def _apply_real_audio_enhancement(
     return np.clip(processed, -1.0, 1.0).astype(np.float32)
 
 
+def _warm_tts_engine_background() -> None:
+    """Warm TTS engine in a background thread so startup remains responsive."""
+    try:
+        engine = get_tts_engine()
+        engine.warm_load()
+        logger.info("TTS engine warmed up and ready for low-latency inference")
+    except Exception as e:
+        logger.warning(f"TTS engine warmup failed: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifecycle setup and teardown."""
     logger.info("Starting Ghost Voice TTS service...")
+    app.state.db_ready = False
 
     if (
         settings.ENFORCE_SECURE_DEFAULTS
         and not settings.DEBUG
         and settings.SECRET_KEY == "your-secret-key-change-in-production"
     ):
-        raise RuntimeError("Unsafe SECRET_KEY configured for non-debug environment")
+        if settings.STARTUP_DEGRADED_MODE:
+            logger.warning("Unsafe SECRET_KEY detected; continuing due to STARTUP_DEGRADED_MODE")
+        else:
+            raise RuntimeError("Unsafe SECRET_KEY configured for non-debug environment")
 
-    create_db_and_tables()
+    try:
+        create_db_and_tables()
+        app.state.db_ready = True
+    except Exception as db_error:
+        if settings.STARTUP_DEGRADED_MODE:
+            logger.warning("Database startup check failed; continuing degraded: %s", db_error)
+        else:
+            raise
 
-    if not settings.DEBUG:
-        try:
-            engine = get_tts_engine()
-            engine.warm_load()
-            logger.info("TTS engine warmed up and ready for low-latency inference")
-        except Exception as e:
-            logger.warning(f"TTS engine warmup failed: {e}")
+    if not settings.DEBUG and settings.TTS_WARM_ON_STARTUP:
+        threading.Thread(target=_warm_tts_engine_background, daemon=True).start()
 
     yield
 
@@ -340,19 +357,35 @@ app.include_router(analytics.router)
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
-    cache = get_redis_cache()
-    engine = get_tts_engine()
-    
-    # Check if cache is operational
-    cache_healthy = cache.health_check()
-    
-    # Check if TTS model is loaded
-    model_loaded = engine._initialized
+    cache_healthy = False
+    model_loaded = False
+    db_healthy = bool(getattr(app.state, "db_ready", False))
+
+    try:
+        with Session(engine) as db_session:
+            db_session.exec(text("SELECT 1"))
+            db_healthy = True
+    except Exception:
+        db_healthy = False
+
+    try:
+        cache = get_redis_cache()
+        cache_healthy = cache.health_check()
+    except Exception:
+        cache_healthy = False
+
+    try:
+        tts_engine = get_tts_engine()
+        model_loaded = bool(tts_engine._initialized)
+    except Exception:
+        model_loaded = False
+
+    overall_status = "healthy"
     
     return HealthResponse(
-        status="healthy",
+        status=overall_status,
         version=settings.API_VERSION,
-        database="connected",
+        database="connected" if db_healthy else "disconnected",
         redis="connected" if cache_healthy else "disconnected",
         tts_model=settings.TTS_MODEL,
         model_loaded=model_loaded,
