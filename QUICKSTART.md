@@ -123,6 +123,38 @@ docker-compose down
 3. **Stream synthesis:** GET `/synthesis/{job_id}/stream` for WebSocket streaming
 4. **Deploy to K8s:** Follow instructions in README.md for production deployment
 
+## Railway Production Deploy
+
+1. Push this repository to GitHub.
+2. In Railway, create a new project from this GitHub repository.
+3. Railway will detect `railway.json` and build with the root `Dockerfile`.
+4. Add the following required environment variables in Railway:
+
+```bash
+DEBUG=False
+HOST=0.0.0.0
+TTS_DEVICE=cpu
+DATABASE_URL=<Railway Postgres URL>
+REDIS_URL=<Railway Redis URL>
+CELERY_BROKER_URL=<Railway Redis URL>
+CELERY_RESULT_BACKEND_URL=<Railway Redis URL>
+SECRET_KEY=<long-random-secret>
+ENFORCE_SECURE_DEFAULTS=True
+TTS_REQUIRE_REAL_MODEL=False
+TTS_ALLOW_SYNTH_FALLBACK=True
+SYNTHESIS_QUEUE_POLICY=inline-fallback
+PUBLIC_BASE_URL=https://<your-railway-domain>
+CORS_ALLOWED_ORIGINS=["https://<your-landing-page-domain>"]
+```
+
+5. After deploy, verify:
+
+```bash
+curl https://<your-railway-domain>/health
+```
+
+6. Point your landing page API base URL to `https://<your-railway-domain>`.
+
 ## Troubleshooting
 
 ### API not responding
