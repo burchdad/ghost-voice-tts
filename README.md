@@ -69,6 +69,71 @@ A production-grade, enterprise-ready text-to-speech service with advanced voice 
 
 ## Architecture
 
+## TTS Node Upgrades (Apr 2026)
+
+This service now operates as a production TTS infrastructure node, not just a basic synthesis API.
+
+### 1) Latency Tiering
+
+Requests can be classified with `mode`:
+- `realtime` - ultra-fast conversational speech
+- `balanced` - default assistant response profile
+- `high_quality` - slower, premium-quality output
+
+Tier is available on synthesis requests and echoed in responses for observability.
+
+### 2) Priority Queueing
+
+Celery now uses tiered queues with explicit priority routing:
+- `tts.realtime` (high priority)
+- `tts.balanced` (normal priority)
+- `tts.high_quality` (background priority)
+
+This prevents heavy jobs from blocking low-latency conversational traffic.
+
+### 3) Progressive Streaming + Audio Stitching
+
+Streaming supports sentence-level progressive synthesis with:
+- sentence chunking for early-first-audio
+- predictive prefetching of upcoming sentence audio
+- silence trimming at chunk edges
+- overlap/crossfade stitching to reduce audible seams
+
+This improves perceived responsiveness and natural continuity in live voice experiences.
+
+### 4) Voice Consistency + Session Continuity
+
+Synthesis requests support:
+- `session_id` for session-level continuity
+- `voice_seed` for deterministic voice generation
+
+Session state is cached with TTL in Redis, allowing consistent tone and settings across turns.
+
+### 5) Provider Routing Resilience
+
+Provider routing includes:
+- per-provider circuit breakers
+- health state tracking (`healthy`, `degraded`, `unhealthy`)
+- automatic fallback sequence per tier
+- adaptive weighted routing based on latency and quality trends
+
+### 6) Capability Descriptor Endpoints
+
+Node capability and provider status are exposed through:
+- `GET /tts/capabilities`
+- `GET /tts/providers/health`
+- `GET /tts/sessions/{session_id}`
+- `DELETE /tts/sessions/{session_id}`
+
+### 7) Edge/Cloud Hybrid Profile
+
+Deployment profile is configurable via:
+- `DEPLOYMENT_PROFILE=cloud|edge|hybrid`
+- `EDGE_PROVIDERS`
+- `CLOUD_PROVIDERS`
+
+In hybrid mode, realtime traffic can prefer edge providers while high-quality traffic prefers cloud providers.
+
 ### Tech Stack
 
 **Backend:** FastAPI + Uvicorn
