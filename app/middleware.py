@@ -7,7 +7,7 @@ import logging
 import uuid
 from typing import Callable
 
-from fastapi import Request, status, HTTPException
+from fastapi import FastAPI, Request, status, HTTPException
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 

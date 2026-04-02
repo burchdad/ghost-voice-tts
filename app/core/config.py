@@ -1,9 +1,13 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 from functools import lru_cache
 
 
 class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=True,
+    )
     # API Config
     API_TITLE: str = "Ghost Voice TTS"
     API_VERSION: str = "1.0.0"
@@ -62,6 +66,65 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "your-secret-key-change-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    ENFORCE_SECURE_DEFAULTS: bool = True
+
+    # CORS
+    CORS_ALLOWED_ORIGINS: list[str] = []
+    CORS_ALLOW_METHODS: list[str] = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"]
+    CORS_ALLOW_HEADERS: list[str] = ["Authorization", "Content-Type", "X-API-Key"]
+
+    # TTS capability and fallback policy
+    TTS_REQUIRE_REAL_MODEL: bool = False
+    TTS_ALLOW_SYNTH_FALLBACK: bool = True
+    TTS_FALLBACK_POLICY: str = "sine"  # sine | error
+    SYNTHESIS_QUEUE_POLICY: str = "inline-fallback"  # required | inline-fallback
+
+    # ── Provider routing ──────────────────────────────────────────────────────
+    # Which provider to use per latency tier.  Values must be provider slugs
+    # known to ProviderRouter: "tortoise" | "vits" | "elevenlabs" | "auto"
+    PROVIDER_REALTIME: str = "vits"       # fastest; VITS / ElevenLabs
+    PROVIDER_BALANCED: str = "auto"       # auto-route based on health
+    PROVIDER_HIGH_QUALITY: str = "tortoise"  # highest quality
+
+    # Provider health monitoring
+    PROVIDER_HEALTH_CHECK_INTERVAL: int = 30   # seconds between health sweeps
+    PROVIDER_FAILURE_THRESHOLD: int = 3        # failures before mark unhealthy
+    PROVIDER_RECOVERY_TIMEOUT: int = 60        # seconds before retry unhealthy provider
+
+    # ── Adaptive provider learning ────────────────────────────────────────────
+    # EMA alpha for latency and quality score smoothing (0 < α ≤ 1).
+    # Lower = slower adaptation (stable); higher = reacts fast to changes.
+    PROVIDER_LEARNING_ALPHA: float = 0.15
+
+    # ── Edge / cloud hybrid deployment ───────────────────────────────────────
+    # Deployment profile controls which providers are considered "edge" vs
+    # "cloud".  Realtime requests prefer edge providers; high-quality requests
+    # prefer cloud providers.  Set DEPLOYMENT_PROFILE to one of:
+    #   "cloud"  — all providers run remotely (default)
+    #   "edge"   — all providers run locally / on-device
+    #   "hybrid" — mix: realtime → edge, high_quality → cloud
+    DEPLOYMENT_PROFILE: str = "cloud"       # cloud | edge | hybrid
+
+    # Edge providers — lightweight, fast, low-resource (e.g. VITS local)
+    EDGE_PROVIDERS: list = ["vits"]
+
+    # Cloud providers — high-quality, may have higher latency / cost
+    CLOUD_PROVIDERS: list = ["tortoise", "elevenlabs"]
+
+    # Latency budget (ms) below which edge is preferred even in "hybrid" mode
+    EDGE_LATENCY_BUDGET_MS: int = 400
+
+    # ── Prefetch / streaming tuning ───────────────────────────────────────────
+    # How many sentences ahead to pre-synthesise.  0 disables prefetch.
+    PREFETCH_HORIZON: int = 2
+
+    # ── Voice session continuity ──────────────────────────────────────────────
+    VOICE_SESSION_TTL: int = 1800          # seconds a session lock is kept in Redis
+    VOICE_SESSION_PREFIX: str = "vsession"
+
+    # Artifact serving/storage
+    PUBLIC_BASE_URL: str = ""
+    STATIC_AUDIO_PREFIX: str = "/static/audio"
     
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -76,11 +139,33 @@ class Settings(BaseSettings):
     PROMETHEUS_ENABLED: bool = True
     METRICS_PORT: int = 8001
     
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
-
-
+    # Stripe Billing
+    STRIPE_API_KEY: Optional[str] = None
+    STRIPE_WEBHOOK_SECRET: Optional[str] = None
+    STRIPE_PUBLISHABLE_KEY: Optional[str] = None
+    
+    # Stripe Pricing (in cents)
+    STRIPE_PRICING: dict = {
+        "starter": {
+            "price_id": "price_starter_test",
+            "monthly_cents": 5000,  # $50/month
+            "character_limit": 1_000_000,
+            "overage_price_per_million_cents": 1500,  # $15 per M chars
+        },
+        "pro": {
+            "price_id": "price_pro_test",
+            "monthly_cents": 50000,  # $500/month
+            "character_limit": 10_000_000,
+            "overage_price_per_million_cents": 1200,  # $12 per M
+        },
+        "enterprise": {
+            "price_id": "price_enterprise_test",
+            "monthly_cents": 0,  # Custom
+            "character_limit": None,
+            "overage_price_per_million_cents": 0,
+        },
+    }
+    
 @lru_cache()
 def get_settings() -> Settings:
     return Settings()

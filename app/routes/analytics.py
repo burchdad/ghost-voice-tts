@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlmodel import Session
 
 from app.dependencies import get_session, get_current_user
+from app.models.db import User
 from app.services.analytics import get_analytics_dashboard
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
@@ -20,11 +21,11 @@ router = APIRouter(prefix="/analytics", tags=["analytics"])
 async def get_usage_summary(
     days: int = Query(30, ge=1, le=365),
     session: Session = Depends(get_session),
-    user: dict = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Get synthesis usage summary."""
     dashboard = get_analytics_dashboard(session)
-    stats = dashboard.get_user_usage_stats(user["id"], days=days)
+    stats = dashboard.get_user_usage_stats(user.id, days=days)
     
     return stats
 
@@ -33,11 +34,11 @@ async def get_usage_summary(
 async def get_daily_usage(
     days: int = Query(30, ge=1, le=365),
     session: Session = Depends(get_session),
-    user: dict = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Get day-by-day usage breakdown."""
     dashboard = get_analytics_dashboard(session)
-    daily = dashboard.get_daily_usage(user["id"], days=days)
+    daily = dashboard.get_daily_usage(user.id, days=days)
     
     return {"daily_stats": daily}
 
@@ -45,11 +46,11 @@ async def get_daily_usage(
 @router.get("/usage/by-voice")
 async def get_voice_usage_stats(
     session: Session = Depends(get_session),
-    user: dict = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Get usage stats per voice."""
     dashboard = get_analytics_dashboard(session)
-    voice_stats = dashboard.get_voice_usage_stats(user["id"])
+    voice_stats = dashboard.get_voice_usage_stats(user.id)
     
     return {"voices": voice_stats}
 
@@ -59,11 +60,11 @@ async def get_voice_usage_stats(
 @router.get("/performance")
 async def get_performance(
     session: Session = Depends(get_session),
-    user: dict = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Get synthesis performance metrics."""
     dashboard = get_analytics_dashboard(session)
-    performance = dashboard.get_synthesis_performance(user["id"])
+    performance = dashboard.get_synthesis_performance(user.id)
     
     return performance
 
@@ -72,11 +73,11 @@ async def get_performance(
 async def get_error_analytics(
     days: int = Query(7, ge=1, le=365),
     session: Session = Depends(get_session),
-    user: dict = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Get error rate analytics."""
     dashboard = get_analytics_dashboard(session)
-    errors = dashboard.get_error_analytics(user["id"], days=days)
+    errors = dashboard.get_error_analytics(user.id, days=days)
     
     return errors
 
@@ -86,11 +87,11 @@ async def get_error_analytics(
 @router.get("/quota")
 async def get_quota_analytics(
     session: Session = Depends(get_session),
-    user: dict = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Get quota usage analytics."""
     dashboard = get_analytics_dashboard(session)
-    quota = dashboard.get_quota_analytics(user["id"])
+    quota = dashboard.get_quota_analytics(user.id)
     
     if not quota:
         raise HTTPException(status_code=404, detail="User not found")
@@ -103,7 +104,7 @@ async def get_quota_analytics(
 @router.get("/quality/distribution")
 async def get_voice_quality_distribution(
     session: Session = Depends(get_session),
-    user: dict = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Get voice quality score distribution."""
     dashboard = get_analytics_dashboard(session)
@@ -118,7 +119,7 @@ async def get_voice_quality_distribution(
 async def get_marketplace_revenue(
     days: int = Query(30, ge=1, le=365),
     session: Session = Depends(get_session),
-    user: dict = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Get marketplace revenue analytics."""
     dashboard = get_analytics_dashboard(session)
@@ -130,7 +131,7 @@ async def get_marketplace_revenue(
 @router.get("/marketplace/voices")
 async def get_marketplace_voice_stats(
     session: Session = Depends(get_session),
-    user: dict = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Get overall voice marketplace statistics."""
     dashboard = get_analytics_dashboard(session)
@@ -145,7 +146,7 @@ async def get_marketplace_voice_stats(
 async def get_usage_trends(
     days: int = Query(30, ge=1, le=365),
     session: Session = Depends(get_session),
-    user: dict = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Get usage trend indicators."""
     dashboard = get_analytics_dashboard(session)
@@ -159,15 +160,15 @@ async def get_usage_trends(
 @router.get("/dashboard")
 async def get_dashboard_summary(
     session: Session = Depends(get_session),
-    user: dict = Depends(get_current_user),
+    user: User = Depends(get_current_user),
 ):
     """Get complete dashboard summary."""
     dashboard = get_analytics_dashboard(session)
     
     return {
-        "usage": dashboard.get_user_usage_stats(user["id"], days=30),
-        "performance": dashboard.get_synthesis_performance(user["id"]),
-        "quota": dashboard.get_quota_analytics(user["id"]),
-        "errors": dashboard.get_error_analytics(user["id"], days=7),
+        "usage": dashboard.get_user_usage_stats(user.id, days=30),
+        "performance": dashboard.get_synthesis_performance(user.id),
+        "quota": dashboard.get_quota_analytics(user.id),
+        "errors": dashboard.get_error_analytics(user.id, days=7),
         "trends": dashboard.get_usage_trends(days=30),
     }

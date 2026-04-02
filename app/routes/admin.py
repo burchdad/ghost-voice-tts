@@ -10,6 +10,7 @@ from sqlmodel import Session
 
 from app.dependencies import get_session, verify_admin
 from app.services.admin_dashboard import get_admin_dashboard
+from app.services.prosody_intelligence import ProsodyLearningStore
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -194,9 +195,28 @@ async def get_system_health(
     return health
 
 
+@router.get("/debug/prosody-learning")
+async def get_prosody_learning_snapshot(
+    limit: int = Query(20, ge=1, le=200),
+    include_sessions: bool = Query(True),
+    admin: dict = Depends(verify_admin),
+):
+    """Get safe snapshot of online prosody learning state for observability."""
+    return ProsodyLearningStore.get_debug_snapshot(limit=limit, include_sessions=include_sessions)
+
+
+@router.get("/debug/prosody-learning/aggregate")
+async def get_prosody_learning_aggregate_snapshot(
+    limit: int = Query(200, ge=1, le=500),
+    admin: dict = Depends(verify_admin),
+):
+    """Get aggregate-only prosody learning stats for stricter observability."""
+    return ProsodyLearningStore.get_aggregate_snapshot(limit=limit)
+
+
 @router.get("/top-users")
 async def get_top_users(
-    metric: str = Query("synthesis_count", regex="^(synthesis_count|characters)$"),
+    metric: str = Query("synthesis_count", pattern="^(synthesis_count|characters)$"),
     limit: int = Query(10, ge=1, le=100),
     session: Session = Depends(get_session),
     admin: dict = Depends(verify_admin),

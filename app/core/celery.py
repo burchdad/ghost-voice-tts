@@ -38,18 +38,60 @@ celery_app.conf.update(
     result_expires=3600,  # Results expire after 1 hour
 )
 
-# Define queues
+# ── Priority-tiered queues ────────────────────────────────────────────────────
+# Three synthesis queues map to the three latency tiers:
+#   tts.realtime     – highest priority (x_max_priority=10, default priority=8)
+#   tts.balanced     – normal throughput (priority=5)
+#   tts.high_quality – background batch  (priority=2)
+#
+# Workers should be started with --queues tts.realtime,tts.balanced,tts.high_quality
+# Redis broker supports priority via x-max-priority.
+
 synthesis_exchange = Exchange("tts", type="direct")
+
 celery_app.conf.task_queues = (
+    Queue(
+        "tts.realtime",
+        synthesis_exchange,
+        routing_key="tts.realtime",
+        queue_arguments={"x-max-priority": 10},
+    ),
+    Queue(
+        "tts.balanced",
+        synthesis_exchange,
+        routing_key="tts.balanced",
+        queue_arguments={"x-max-priority": 10},
+    ),
+    Queue(
+        "tts.high_quality",
+        synthesis_exchange,
+        routing_key="tts.high_quality",
+        queue_arguments={"x-max-priority": 10},
+    ),
+    # Legacy / voice-cloning queues kept for backward compat
     Queue("synthesis", synthesis_exchange, routing_key="synthesis"),
     Queue("voice_cloning", synthesis_exchange, routing_key="voice_cloning"),
     Queue("default", synthesis_exchange, routing_key="default"),
 )
 
+# Default route (mode-aware routing happens in the endpoint via apply_async)
 celery_app.conf.task_routes = {
-    "app.tasks.synthesis.synthesize_text": {"queue": "synthesis"},
+    "app.tasks.synthesis.synthesize_text": {"queue": "tts.balanced"},
     "app.tasks.voice_cloning.encode_voice_samples": {"queue": "voice_cloning"},
 }
+
+# ── Priority helpers ──────────────────────────────────────────────────────────
+_MODE_QUEUE: dict = {
+    "realtime":     ("tts.realtime",     8),
+    "balanced":     ("tts.balanced",     5),
+    "high_quality": ("tts.high_quality", 2),
+}
+
+
+def queue_for_mode(mode: str) -> tuple[str, int]:
+    """Return (queue_name, priority) for a synthesis mode string."""
+    return _MODE_QUEUE.get(mode, _MODE_QUEUE["balanced"])
+
 
 celery_app.Task = ContextTask
 

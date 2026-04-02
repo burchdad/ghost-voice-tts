@@ -1,28 +1,38 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, WebSocket, WebSocketDisconnect, status
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header, WebSocket, WebSocketDisconnect, status, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlmodel import Session
+from fastapi.staticfiles import StaticFiles
+from sqlmodel import Session, select
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import uuid
 import json
 import numpy as np
+import time
+import os
+import pickle
+import soundfile as sf
+from contextlib import asynccontextmanager
+import threading
 
 from app.core.config import get_settings
-from app.core.database import create_db_and_tables, get_session
+from app.core.database import create_db_and_tables, get_session, engine
 from app.core.logging import setup_logging
 from app.core.metrics import metrics_registry, MetricsCollector
 from app.schemas.tts import (
     SynthesisRequest, SynthesisResponse,
     VoiceResponse, VoiceCloningRequest, VoiceUpdate,
     HealthResponse, UserResponse, SSMLSynthesisRequest,
+    SynthesisModeEnum,
 )
-from app.models.db import User, Voice, SynthesisJob
+from app.models.db import User, Voice, SynthesisJob, Subscription, VoiceSample
 from app.services.tts_engine import get_tts_engine
 from app.services.cache import get_redis_cache
 from app.services.streaming import StreamingTTSManager
 from app.services.security import get_security_manager, TokenResponse
+from app.services.billing import get_billing_manager
 from app.tasks.synthesis import synthesize_text_task, encode_voice_samples_task
+from app.core.celery import queue_for_mode
 from app.middleware import setup_middlewares
 from app.dependencies import get_current_user, get_current_user_optional
 from app.routes import admin, analytics
@@ -32,21 +42,151 @@ setup_logging()
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _run_inline_fallback_synthesis(
+    *,
+    job_id: str,
+    text: str,
+    voice: Voice,
+    speed: float,
+    pitch: float,
+    style: str,
+    emotion: str | None = None,
+    secondary_emotion: str | None = None,
+    emotion_blend: float = 0.0,
+    emotion_intensity: float = 1.0,
+    emotion_curve: str = "arc",
+    prosody_template: str | None = None,
+    prosody_template_axes: dict | None = None,
+    template_composition_data: list | None = None,
+    auto_template: bool = False,
+    hierarchical_prosody_config: dict | None = None,
+    session_id: str | None = None,
+    ml_refinement: bool = True,
+    phoneme_alignment: bool = True,
+):
+    """Best-effort background fallback when queue transport is unavailable."""
+    try:
+        synth_engine = get_tts_engine()
+        start = time.time()
+
+        voice_embedding = None
+        if voice.speaker_embedding:
+            try:
+                voice_embedding = pickle.loads(voice.speaker_embedding)
+            except Exception:
+                voice_embedding = None
+
+        audio, sample_rate = synth_engine.synthesize(
+            text=text,
+            voice_embedding=voice_embedding,
+            speed=speed,
+            pitch=pitch,
+            style=style,
+            emotion=emotion,
+            emotion_secondary=secondary_emotion,
+            emotion_blend=emotion_blend,
+            emotion_intensity=emotion_intensity,
+            emotion_curve=emotion_curve,
+            prosody_template=prosody_template,
+            prosody_template_axes=prosody_template_axes,
+            template_composition_data=template_composition_data,
+            auto_template=auto_template,
+            hierarchical_prosody_config=hierarchical_prosody_config,
+            session_id=session_id,
+            ml_refinement=ml_refinement,
+            phoneme_alignment=phoneme_alignment,
+        )
+
+        output_dir = os.path.join("uploads", "audio")
+        os.makedirs(output_dir, exist_ok=True)
+        output_path = os.path.join(output_dir, f"{job_id}.wav")
+        sf.write(output_path, audio, sample_rate)
+
+        elapsed_ms = (time.time() - start) * 1000
+
+        with Session(engine) as bg_session:
+            job = bg_session.exec(select(SynthesisJob).where(SynthesisJob.id == job_id)).first()
+            if not job:
+                return
+
+            job.status = "completed"
+            job.progress = 1.0
+            job.audio_url = f"{settings.STATIC_AUDIO_PREFIX}/{job_id}.wav"
+            job.audio_duration = float(len(audio) / sample_rate)
+            job.inference_time_ms = elapsed_ms
+            job.completed_at = utc_now()
+            bg_session.add(job)
+            bg_session.commit()
+    except Exception as fallback_error:
+        logger.error(f"Inline fallback failed for job {job_id}: {fallback_error}")
+        try:
+            with Session(engine) as bg_session:
+                job = bg_session.exec(select(SynthesisJob).where(SynthesisJob.id == job_id)).first()
+                if job:
+                    job.status = "failed"
+                    job.error_message = str(fallback_error)
+                    bg_session.add(job)
+                    bg_session.commit()
+        except Exception as db_error:
+            logger.error(f"Failed to update fallback error status for job {job_id}: {db_error}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifecycle setup and teardown."""
+    logger.info("Starting Ghost Voice TTS service...")
+
+    if (
+        settings.ENFORCE_SECURE_DEFAULTS
+        and not settings.DEBUG
+        and settings.SECRET_KEY == "your-secret-key-change-in-production"
+    ):
+        raise RuntimeError("Unsafe SECRET_KEY configured for non-debug environment")
+
+    create_db_and_tables()
+
+    if not settings.DEBUG:
+        try:
+            engine = get_tts_engine()
+            engine.warm_load()
+            logger.info("TTS engine warmed up and ready for low-latency inference")
+        except Exception as e:
+            logger.warning(f"TTS engine warmup failed: {e}")
+
+    yield
+
+    logger.info("Shutting down Ghost Voice TTS service...")
+    cache = get_redis_cache()
+    cache.close()
+
 # Create FastAPI app
 app = FastAPI(
     title=settings.API_TITLE,
     description=settings.API_DESCRIPTION,
     version=settings.API_VERSION,
     debug=settings.DEBUG,
+    lifespan=lifespan,
 )
 
+os.makedirs(os.path.join("uploads", "audio"), exist_ok=True)
+app.mount("/static", StaticFiles(directory="uploads"), name="static")
+
 # Add CORS middleware
+cors_origins = settings.CORS_ALLOWED_ORIGINS
+if settings.DEBUG and not cors_origins:
+    cors_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=cors_origins,
+    allow_credentials=bool(cors_origins),
+    allow_methods=settings.CORS_ALLOW_METHODS,
+    allow_headers=settings.CORS_ALLOW_HEADERS,
 )
 
 # Setup security, rate limiting, and observability middleware
@@ -57,49 +197,111 @@ app.include_router(admin.router)
 app.include_router(analytics.router)
 
 
-# ============ Startup & Shutdown ============
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize on startup."""
-    logger.info("Starting Ghost Voice TTS service...")
-    create_db_and_tables()
-    
-    # Warm up TTS engine - keeps models loaded in memory
-    if not settings.DEBUG:
-        try:
-            engine = get_tts_engine()
-            engine.warm_load()
-            logger.info("TTS engine warmed up and ready for low-latency inference")
-        except Exception as e:
-            logger.warning(f"TTS engine warmup failed: {e}")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown."""
-    logger.info("Shutting down Ghost Voice TTS service...")
-    cache = get_redis_cache()
-    cache.close()
-
-
 # ============ Health & Status Endpoints ============
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint."""
     cache = get_redis_cache()
-    db_status = "connected"
-    redis_status = "connected" if cache.health_check() else "disconnected"
+    engine = get_tts_engine()
+    
+    # Check if cache is operational
+    cache_healthy = cache.health_check()
+    
+    # Check if TTS model is loaded
+    model_loaded = engine._initialized
     
     return HealthResponse(
         status="healthy",
         version=settings.API_VERSION,
-        database=db_status,
-        redis=redis_status,
+        database="connected",
+        redis="connected" if cache_healthy else "disconnected",
         tts_model=settings.TTS_MODEL,
-        timestamp=datetime.utcnow(),
+        model_loaded=model_loaded,
+        cache_enabled=cache_healthy,
+        timestamp=utc_now(),
     )
+
+
+@app.get("/tts/capabilities")
+async def tts_capabilities():
+    """
+    Capability descriptor for this TTS node.
+
+    Designed for plug-and-play with Ghost Voice OS and other orchestrators:
+    the caller can inspect this response to decide which TTS instance to route
+    requests to based on latency tier, language support, streaming capability,
+    etc.
+    """
+    engine = get_tts_engine()
+    from app.services.provider_router import get_provider_router
+    router = get_provider_router()
+
+    return {
+        # ── Core capabilities ──────────────────────────────────────────────
+        "supports_streaming": settings.ENABLE_STREAMING,
+        "supports_voice_cloning": settings.ENABLE_VOICE_CLONING,
+        "supports_ssml": True,
+        "supports_multilingual": settings.ENABLE_MULTILINGUAL,
+        "supports_progressive_streaming": True,
+        # ── Latency tiers ─────────────────────────────────────────────────
+        "latency_tiers": {
+            "realtime":     {"target_ms": 300,  "provider": settings.PROVIDER_REALTIME},
+            "balanced":     {"target_ms": 1500, "provider": settings.PROVIDER_BALANCED},
+            "high_quality": {"target_ms": 8000, "provider": settings.PROVIDER_HIGH_QUALITY},
+        },
+        # ── Provider health ────────────────────────────────────────────────
+        "providers": router.health_snapshot(),
+        # ── Voices & languages ────────────────────────────────────────────
+        "languages": ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh", "ru"],
+        "models": [settings.TTS_MODEL],
+        # ── Session / consistency ─────────────────────────────────────────
+        "supports_session_continuity": True,
+        "supports_voice_seed": True,
+        "voice_session_ttl_seconds": settings.VOICE_SESSION_TTL,
+        # ── Runtime flags ─────────────────────────────────────────────────
+        "model_loaded": engine._initialized,
+        "real_synthesis_available": engine._supports_real_synthesis,
+        "fallback_allowed": settings.TTS_ALLOW_SYNTH_FALLBACK,
+        "fallback_policy": engine._fallback_policy,
+        "api_version": settings.API_VERSION,
+          # ── Deployment profile ────────────────────────────────────────────
+          "deployment": router.deployment_info(),
+     }
+
+
+@app.get("/tts/providers/health")
+async def provider_health():
+    """Live health status of all registered TTS providers."""
+    from app.services.provider_router import get_provider_router
+    router = get_provider_router()
+    return {
+        "providers": router.health_snapshot(),
+        "timestamp": utc_now(),
+    }
+
+
+@app.get("/tts/sessions/{session_id}")
+async def get_voice_session(
+    session_id: str,
+    user: User = Depends(get_current_user),
+):
+    """Retrieve the locked voice settings for a TTS session."""
+    from app.services.voice_session import get_voice_session_manager
+    state = get_voice_session_manager().get(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+    return state.to_dict()
+
+
+@app.delete("/tts/sessions/{session_id}", status_code=204)
+async def delete_voice_session(
+    session_id: str,
+    user: User = Depends(get_current_user),
+):
+    """Explicitly expire a TTS voice session."""
+    from app.services.voice_session import get_voice_session_manager
+    get_voice_session_manager().delete(session_id)
 
 
 @app.get("/metrics")
@@ -111,7 +313,7 @@ async def metrics():
         "total_syntheses": cache.get_counter("syntheses:total"),
         "total_characters": cache.get_counter("characters:total"),
         "active_jobs": cache.get_counter("jobs:active"),
-        "timestamp": datetime.utcnow(),
+        "timestamp": utc_now(),
     }
 
 
@@ -138,8 +340,8 @@ async def register_user(
 ):
     """Register a new user."""
     # Check if user exists
-    existing = session.query(User).filter(
-        (User.email == email) | (User.username == username)
+    existing = session.exec(
+        select(User).where((User.email == email) | (User.username == username))
     ).first()
     
     if existing:
@@ -177,7 +379,7 @@ async def login_user(
     session: Session = Depends(get_session),
 ):
     """Authenticate user and return JWT token."""
-    user = session.query(User).filter(User.email == email).first()
+    user = session.exec(select(User).where(User.email == email)).first()
     
     if not user:
         raise HTTPException(
@@ -270,8 +472,7 @@ async def get_my_quota(
 @app.post("/quota/check")
 async def check_quota(
     text_length: int,
-    authorization: str = Header(None),
-    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
 ):
     """
     Check if user can synthesize text of given length.
@@ -281,10 +482,6 @@ async def check_quota(
     
     if text_length <= 0 or text_length > 5000:
         raise HTTPException(status_code=400, detail="Invalid text length")
-    
-    user = session.query(User).filter(User.is_active == True).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
     
     from app.services.quota import get_quota_manager
     quota_mgr = get_quota_manager()
@@ -303,7 +500,7 @@ async def check_quota(
 @app.post("/synthesize", response_model=SynthesisResponse)
 async def synthesize(
     request: SynthesisRequest,
-    authorization: str = Header(None),
+    user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
     """
@@ -321,14 +518,9 @@ async def synthesize(
         raise HTTPException(status_code=400, detail="Text cannot be empty")
     
     # Verify voice exists
-    voice = session.query(Voice).filter(Voice.id == request.voice_id).first()
+    voice = session.exec(select(Voice).where(Voice.id == request.voice_id)).first()
     if not voice:
         raise HTTPException(status_code=404, detail="Voice not found")
-    
-    # Get user from auth
-    user = session.query(User).filter(User.is_active == True).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
     
     # Check quota
     from app.services.quota import get_quota_manager
@@ -353,52 +545,165 @@ async def synthesize(
         pitch=request.pitch,
         status="pending",
     )
-    
+
     session.add(job)
     session.commit()
     session.refresh(job)
+
+    # ── Voice session continuity ──────────────────────────────────────────
+    from app.services.voice_session import get_voice_session_manager
+    vs_mgr = get_voice_session_manager()
+    voice_state = vs_mgr.get_or_create(
+        session_id=request.session_id,
+        voice_id=request.voice_id,
+        voice_seed=request.voice_seed,
+        mode=request.mode.value,
+        style=request.style.value if hasattr(request.style, "value") else request.style,
+        speed=request.speed,
+        pitch=request.pitch,
+    )
+    effective_voice_id = voice_state.voice_id
+    effective_seed = voice_state.voice_seed
+    effective_session_id = voice_state.session_id
     
     # Deduct quota
     quota_mgr.deduct_quota(user, len(request.text), session)
     
+    # Record usage for billing
+    billing_mgr = get_billing_manager()
+    billing_mgr.record_usage(
+        user=user,
+        quantity=len(request.text),
+        session=session,
+        description=f"Synthesis: {request.text[:50]}...",
+        synthesis_job_id=job.id,
+    )
+    
     # Get voice embedding from cache
     cache = get_redis_cache()
-    voice_embedding_bytes = cache.get_embedding(request.voice_id)
-    
-    # Queue synthesis task
+    voice_embedding_bytes = cache.get_embedding(effective_voice_id)
+
+    # Queue synthesis task — route to priority queue based on mode
     from app.utils.cache_keys import CacheKeyGenerator
     cache_key = CacheKeyGenerator.generate_synthesis_key(
         text=request.text,
-        voice_id=request.voice_id,
+        voice_id=effective_voice_id,
         language=request.language,
         style=request.style,
         speed=request.speed,
         pitch=request.pitch,
+        emotion=request.emotion or "",
+        secondary_emotion=request.secondary_emotion or "",
+        emotion_blend=request.emotion_blend,
+        emotion_intensity=request.emotion_intensity,
+        emotion_curve=request.emotion_curve.value if hasattr(request.emotion_curve, "value") else str(request.emotion_curve),
+        prosody_template=request.prosody_template.value if request.prosody_template else "",
+        prosody_template_axes=json.dumps(request.prosody_template_axes or {}, sort_keys=True),
+        template_composition=json.dumps(
+            [item.model_dump() for item in request.template_composition] if request.template_composition else [],
+            sort_keys=True,
+        ),
+        auto_template=request.auto_template,
+        ml_refinement=request.ml_prosody_refinement,
+        phoneme_alignment=request.phoneme_alignment,
     )
-    
-    task = synthesize_text_task.apply_async(
-        kwargs={
-            "job_id": job.id,
-            "text": request.text,
-            "voice_id": request.voice_id,
-            "voice_embedding_bytes": voice_embedding_bytes or b"",
-            "language": request.language,
-            "style": request.style,
-            "speed": request.speed,
-            "pitch": request.pitch,
-            "cache_key": cache_key,
-        },
-        task_id=f"synthesis-{job.id}",
-    )
-    
-    logger.info(f"Synthesis job {job.id} queued with task {task.id}")
-    
-    return SynthesisResponse(
-        id=job.id,
-        status=job.status,
-        progress=0.0,
-        created_at=job.created_at,
-    )
+
+    queue_name, task_priority = queue_for_mode(request.mode.value)
+
+    try:
+        task = synthesize_text_task.apply_async(
+            kwargs={
+                "job_id": job.id,
+                "text": request.text,
+                "voice_id": effective_voice_id,
+                "voice_embedding_bytes": voice_embedding_bytes or b"",
+                "language": request.language,
+                "style": request.style,
+                "speed": request.speed,
+                "pitch": request.pitch,
+                "emotion": request.emotion,
+                "secondary_emotion": request.secondary_emotion,
+                "emotion_blend": request.emotion_blend,
+                "emotion_intensity": request.emotion_intensity,
+                "emotion_curve": request.emotion_curve.value if hasattr(request.emotion_curve, "value") else str(request.emotion_curve),
+                "prosody_template": request.prosody_template.value if request.prosody_template else None,
+                "cache_key": cache_key,
+                "mode": request.mode.value,
+                "voice_seed": effective_seed,
+                "session_id": effective_session_id,
+                "prosody_template_axes": request.prosody_template_axes,
+                "template_composition_data": [
+                    item.model_dump() for item in request.template_composition
+                ] if request.template_composition else None,
+                "auto_template": request.auto_template,
+                "hierarchical_prosody_config": request.hierarchical_prosody.model_dump() if request.hierarchical_prosody else None,
+                "ml_refinement": request.ml_prosody_refinement,
+                "phoneme_alignment": request.phoneme_alignment,
+            },
+            task_id=f"synthesis-{job.id}",
+            queue=queue_name,
+            priority=task_priority,
+        )
+        logger.info(
+            "Synthesis job %s queued on %s (priority=%d, mode=%s)",
+            job.id, queue_name, task_priority, request.mode.value,
+        )
+
+        return SynthesisResponse(
+            id=job.id,
+            status=job.status,
+            progress=0.0,
+            created_at=job.created_at,
+            mode=request.mode,
+            session_id=effective_session_id,
+        )
+    except Exception as e:
+        logger.warning(f"Task queue unavailable for job {job.id}: {e}")
+
+        if settings.SYNTHESIS_QUEUE_POLICY == "required" or not settings.TTS_ALLOW_SYNTH_FALLBACK:
+            job.status = "failed"
+            job.error_message = "Queue unavailable and fallback disabled"
+            session.add(job)
+            session.commit()
+            raise HTTPException(status_code=503, detail="Synthesis queue unavailable")
+
+        fallback_thread = threading.Thread(
+            target=_run_inline_fallback_synthesis,
+            kwargs={
+                "job_id": job.id,
+                "text": request.text,
+                "voice": voice,
+                "speed": request.speed,
+                "pitch": request.pitch,
+                "style": request.style,
+                "emotion": request.emotion,
+                "secondary_emotion": request.secondary_emotion,
+                "emotion_blend": request.emotion_blend,
+                "emotion_intensity": request.emotion_intensity,
+                "emotion_curve": request.emotion_curve.value if hasattr(request.emotion_curve, "value") else str(request.emotion_curve),
+                "prosody_template": request.prosody_template.value if request.prosody_template else None,
+                "prosody_template_axes": request.prosody_template_axes,
+                "template_composition_data": [
+                    item.model_dump() for item in request.template_composition
+                ] if request.template_composition else None,
+                "auto_template": request.auto_template,
+                "hierarchical_prosody_config": request.hierarchical_prosody.model_dump() if request.hierarchical_prosody else None,
+                "session_id": effective_session_id,
+                "ml_refinement": request.ml_prosody_refinement,
+                "phoneme_alignment": request.phoneme_alignment,
+            },
+            daemon=True,
+        )
+        fallback_thread.start()
+
+        return SynthesisResponse(
+            id=job.id,
+            status="pending",
+            progress=0.0,
+            created_at=job.created_at,
+            mode=request.mode,
+            session_id=effective_session_id,
+        )
 
 
 @app.get("/synthesis/{job_id}", response_model=SynthesisResponse)
@@ -408,7 +713,7 @@ async def get_synthesis_status(
 ):
     """Get synthesis job status and result."""
     
-    job = session.query(SynthesisJob).filter(SynthesisJob.id == job_id).first()
+    job = session.exec(select(SynthesisJob).where(SynthesisJob.id == job_id)).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     
@@ -429,7 +734,7 @@ async def synthesize_batch(
     voice_id: str,
     texts: list[str],
     language: str = "en",
-    authorization: str = Header(None),
+    user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
     """
@@ -459,13 +764,8 @@ async def synthesize_batch(
     if max_chars > 50000:
         raise HTTPException(status_code=400, detail="Batch too large (max 50k characters)")
     
-    # Get user and verify
-    user = session.query(User).filter(User.is_active == True).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    
     # Verify voice exists
-    voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    voice = session.exec(select(Voice).where(Voice.id == voice_id)).first()
     if not voice:
         raise HTTPException(status_code=404, detail="Voice not found")
     
@@ -617,17 +917,18 @@ async def synthesize_ssml(
         )
     
     # Get voice
-    voice = session.query(Voice).filter(Voice.id == request.voice_id).first()
+    voice = session.exec(select(Voice).where(Voice.id == request.voice_id)).first()
     if not voice:
         raise HTTPException(status_code=404, detail="Voice not found")
     
     # Create synthesis job
     job = SynthesisJob(
         text=plain_text,
-        ssml=request.ssml,
+        text_hash=str(hash(plain_text)),
         voice_id=request.voice_id,
         user_id=user.id,
         language=request.language,
+        style="normal",
         status="pending",
     )
     session.add(job)
@@ -706,7 +1007,7 @@ async def websocket_synthesize_ssml(
         from app.core.database import SessionLocal
         session = SessionLocal()
         
-        voice = session.query(Voice).filter(Voice.id == voice_id).first()
+        voice = session.exec(select(Voice).where(Voice.id == voice_id)).first()
         if not voice:
             await websocket.send_json({
                 "type": "error",
@@ -755,15 +1056,10 @@ async def websocket_synthesize_ssml(
 @app.post("/voices/create", response_model=VoiceResponse)
 async def create_voice(
     request: VoiceCloningRequest,
-    authorization: str = Header(None),
+    user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
     """Create a new voice for cloning."""
-    
-    # Get user from auth
-    user = session.query(User).filter(User.is_active == True).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
     
     voice = Voice(
         owner_id=user.id,
@@ -791,7 +1087,7 @@ async def get_voice(
 ):
     """Get voice details."""
     
-    voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    voice = session.exec(select(Voice).where(Voice.id == voice_id)).first()
     if not voice:
         raise HTTPException(status_code=404, detail="Voice not found")
     
@@ -805,18 +1101,17 @@ async def get_voice(
 async def upload_voice_sample(
     voice_id: str,
     file: UploadFile = File(...),
-    authorization: str = Header(None),
+    user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
     """Upload an audio sample for voice cloning with validation."""
     
-    voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    voice = session.exec(select(Voice).where(Voice.id == voice_id)).first()
     if not voice:
         raise HTTPException(status_code=404, detail="Voice not found")
     
     # Verify ownership
-    user = session.query(User).filter(User.is_active == True).first()
-    if not user or voice.owner_id != user.id:
+    if voice.owner_id != user.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
     
     # Read audio file
@@ -828,23 +1123,94 @@ async def upload_voice_sample(
     # Validate audio
     try:
         from app.services.audio_validation import validate_audio, AudioValidationError
+        cache = get_redis_cache()
+        upload_id = str(uuid.uuid4())
+        status_key = f"voice-upload:{voice_id}"
         
         audio, sr, metadata = validate_audio(content, file.filename)
+
+        ext = os.path.splitext(file.filename or "sample.wav")[1] or ".wav"
+        sample_dir = os.path.join("uploads", "voice_samples", voice_id)
+        os.makedirs(sample_dir, exist_ok=True)
+        sample_path = os.path.join(sample_dir, f"{upload_id}{ext}")
+        with open(sample_path, "wb") as out_file:
+            out_file.write(content)
+
+        quality_score = max(0.0, min(1.0, metadata["snr"] / 40.0))
+        sample = VoiceSample(
+            voice_id=voice_id,
+            audio_url=f"/{sample_path}",
+            duration=len(audio) / sr,
+            sample_rate=sr,
+            quality_score=quality_score,
+        )
+        session.add(sample)
+        session.commit()
+        session.refresh(sample)
+
+        sample_urls = json.loads(voice.sample_urls) if voice.sample_urls else []
+        sample_urls.append(sample.audio_url)
+        voice.sample_urls = json.dumps(sample_urls)
+        voice.quality_score = max(voice.quality_score, quality_score)
+        session.add(voice)
+        session.commit()
         
         logger.info(
             f"Voice sample validated for {voice_id}: "
             f"SNR={metadata['snr']:.1f}dB, "
             f"Loudness={metadata['loudness']:.1f}LUFS"
         )
-        
-        # TODO: In production, upload to S3 and queue voice encoding task
-        # from app.tasks.synthesis import encode_voice_samples_task
-        # encode_voice_samples_task.apply_async(kwargs={...})
+
+        cache.set_job_status(status_key, {
+            "status": "processing",
+            "voice_id": voice_id,
+            "upload_id": upload_id,
+            "sample_id": sample.id,
+            "updated_at": utc_now().isoformat(),
+        })
+
+        try:
+            task = encode_voice_samples_task.apply_async(
+                kwargs={
+                    "voice_id": voice_id,
+                    "audio_bytes_list": [audio.astype(np.float32).tobytes()],
+                    "sample_rates": [sr],
+                },
+                task_id=f"voice-encode-{voice_id}-{upload_id}",
+            )
+            cache.set_job_status(status_key, {
+                "status": "queued",
+                "voice_id": voice_id,
+                "upload_id": upload_id,
+                "sample_id": sample.id,
+                "task_id": task.id,
+                "updated_at": utc_now().isoformat(),
+            })
+            pipeline_status = "queued"
+        except Exception as queue_error:
+            logger.warning(f"Voice encoding queue unavailable for {voice_id}; using local fallback: {queue_error}")
+            engine_instance = get_tts_engine()
+            embedding = engine_instance.encode_voice(audio, sr)
+            voice.speaker_embedding = embedding.astype(np.float32).tobytes()
+            voice.updated_at = utc_now()
+            session.add(voice)
+            session.commit()
+            cache.set_job_status(status_key, {
+                "status": "completed",
+                "voice_id": voice_id,
+                "upload_id": upload_id,
+                "sample_id": sample.id,
+                "pipeline": "sync-fallback",
+                "updated_at": utc_now().isoformat(),
+            })
+            pipeline_status = "completed"
         
         return {
-            "status": "received",
+            "status": pipeline_status,
             "message": "Voice sample validated and queued for processing",
             "voice_id": voice_id,
+            "upload_id": upload_id,
+            "sample_id": sample.id,
             "filename": file.filename,
             "metadata": {
                 "duration_seconds": len(audio) / sr,
@@ -863,6 +1229,41 @@ async def upload_voice_sample(
         raise HTTPException(status_code=500, detail="Audio processing failed")
 
 
+@app.get("/voices/{voice_id}/upload-status")
+async def get_voice_upload_status(
+    voice_id: str,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Get latest upload/encoding status for a voice."""
+    voice = session.exec(select(Voice).where(Voice.id == voice_id)).first()
+    if not voice:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    if voice.owner_id != user.id:
+        raise HTTPException(status_code=403, detail="Unauthorized")
+
+    cache = get_redis_cache()
+    status_data = cache.get_job_status(f"voice-upload:{voice_id}")
+
+    latest_sample = session.exec(
+        select(VoiceSample)
+        .where(VoiceSample.voice_id == voice_id)
+        .order_by(VoiceSample.created_at.desc())
+    ).first()
+
+    return {
+        "voice_id": voice_id,
+        "upload_status": status_data or {"status": "unknown"},
+        "latest_sample": {
+            "id": latest_sample.id,
+            "audio_url": latest_sample.audio_url,
+            "duration": latest_sample.duration,
+            "sample_rate": latest_sample.sample_rate,
+            "quality_score": latest_sample.quality_score,
+        } if latest_sample else None,
+    }
+
+
 @app.get("/voices")
 async def list_voices(
     skip: int = 0,
@@ -873,22 +1274,21 @@ async def list_voices(
 ):
     """List all public voices with filtering options."""
     
-    query = session.query(Voice).filter(Voice.is_public == True)
-    
+    query = select(Voice).where(Voice.is_public == True)
+
     if verified_only:
-        query = query.filter(Voice.is_verified == True)
-    
+        query = query.where(Voice.is_verified == True)
+
     if language:
-        query = query.filter(Voice.language == language)
-    
-    # Order by quality score and creation date
-    voices = query.order_by(
-        Voice.quality_score.desc(),
-        Voice.created_at.desc()
-    ).offset(skip).limit(limit).all()
-    
+        query = query.where(Voice.language == language)
+
+    voices = session.exec(
+        query.order_by(Voice.quality_score.desc(), Voice.created_at.desc()).offset(skip).limit(limit)
+    ).all()
+    total_count = len(session.exec(query).all())
+
     return {
-        "total_count": query.count(),
+        "total_count": total_count,
         "skip": skip,
         "limit": limit,
         "voices": voices,
@@ -902,7 +1302,7 @@ async def get_voice_metadata(
 ):
     """Get detailed voice metadata including usage statistics."""
     
-    voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    voice = session.exec(select(Voice).where(Voice.id == voice_id)).first()
     if not voice:
         raise HTTPException(status_code=404, detail="Voice not found")
     
@@ -929,18 +1329,17 @@ async def get_voice_metadata(
 async def update_voice(
     voice_id: str,
     request: VoiceUpdate,
-    authorization: str = Header(None),
+    user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
     """Update voice details."""
     
-    voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    voice = session.exec(select(Voice).where(Voice.id == voice_id)).first()
     if not voice:
         raise HTTPException(status_code=404, detail="Voice not found")
     
     # Verify ownership
-    user = session.query(User).filter(User.is_active == True).first()
-    if not user or voice.owner_id != user.id:
+    if voice.owner_id != user.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
     
     if request.name:
@@ -950,7 +1349,7 @@ async def update_voice(
     if request.is_public is not None:
         voice.is_public = request.is_public
     
-    voice.updated_at = datetime.utcnow()
+    voice.updated_at = utc_now()
     session.add(voice)
     session.commit()
     session.refresh(voice)
@@ -963,18 +1362,17 @@ async def update_voice(
 @app.delete("/voices/{voice_id}")
 async def delete_voice(
     voice_id: str,
-    authorization: str = Header(None),
+    user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
     """Delete a voice."""
     
-    voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    voice = session.exec(select(Voice).where(Voice.id == voice_id)).first()
     if not voice:
         raise HTTPException(status_code=404, detail="Voice not found")
     
     # Verify ownership
-    user = session.query(User).filter(User.is_active == True).first()
-    if not user or voice.owner_id != user.id:
+    if voice.owner_id != user.id:
         raise HTTPException(status_code=403, detail="Unauthorized")
     
     session.delete(voice)
@@ -987,16 +1385,12 @@ async def delete_voice(
 
 @app.get("/me/voices")
 async def list_my_voices(
-    authorization: str = Header(None),
+    user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
     """List voices owned by the current user."""
     
-    user = session.query(User).filter(User.is_active == True).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    
-    voices = session.query(Voice).filter(Voice.owner_id == user.id).all()
+    voices = session.exec(select(Voice).where(Voice.owner_id == user.id)).all()
     
     return {
         "user_id": user.id,
@@ -1010,18 +1404,14 @@ async def clone_voice(
     voice_id: str,
     new_name: str,
     new_description: str = None,
-    authorization: str = Header(None),
+    user: User = Depends(get_current_user),
     session: Session = Depends(get_session),
 ):
     """Clone an existing voice as a new voice."""
     
-    source_voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    source_voice = session.exec(select(Voice).where(Voice.id == voice_id)).first()
     if not source_voice:
         raise HTTPException(status_code=404, detail="Source voice not found")
-    
-    user = session.query(User).filter(User.is_active == True).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
     
     # Create new voice with cloned embedding
     cloned_voice = Voice(
@@ -1070,7 +1460,7 @@ async def contribute_voice_to_marketplace(
         )
     
     # Get voice
-    voice = session.query(Voice).filter(Voice.id == voice_id).first()
+    voice = session.exec(select(Voice).where(Voice.id == voice_id)).first()
     if not voice:
         raise HTTPException(status_code=404, detail="Voice not found")
     
@@ -1113,8 +1503,8 @@ async def withdraw_voice_contribution(
     from app.models.db import VoiceContribution
     from app.services.marketplace import get_marketplace_manager
     
-    contribution = session.query(VoiceContribution).filter(
-        VoiceContribution.id == contribution_id,
+    contribution = session.exec(
+        select(VoiceContribution).where(VoiceContribution.id == contribution_id)
     ).first()
     
     if not contribution:
@@ -1150,7 +1540,7 @@ async def get_my_voice_contributions(
     
     result = []
     for contrib in contributions:
-        voice = session.query(Voice).filter(Voice.id == contrib.voice_id).first()
+        voice = session.exec(select(Voice).where(Voice.id == contrib.voice_id)).first()
         stats = await marketplace.get_voice_usage_stats(contrib.voice_id)
         
         result.append({
@@ -1189,7 +1579,7 @@ async def get_my_free_trial_status(
             "message": "No active free trial",
         }
     
-    now = datetime.datetime.utcnow()
+    now = utc_now()
     days_remaining = (grant.end_date - now).days
     
     # Get bonus quota remaining
@@ -1234,6 +1624,247 @@ async def get_marketplace_stats(
     }
 
 
+# ============ Billing Endpoints ============
+
+@app.post("/billing/subscribe")
+async def subscribe_to_tier(
+    tier: str,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Subscribe to a pricing tier."""
+    from app.services.billing import get_billing_manager, StripeError
+    
+    if tier not in ["starter", "pro", "enterprise"]:
+        raise HTTPException(status_code=400, detail="Invalid tier")
+    
+    if user.tier == tier:
+        raise HTTPException(status_code=400, detail="Already on this tier")
+    
+    billing_mgr = get_billing_manager()
+    
+    try:
+        result = billing_mgr.create_subscription(user, tier, session)
+        return result
+    except StripeError as e:
+        logger.error(f"Subscription creation failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error during subscription: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to create subscription")
+
+
+@app.post("/billing/update-tier")
+async def update_subscription_tier(
+    tier: str,
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Upgrade or downgrade subscription tier."""
+    from app.services.billing import get_billing_manager, StripeError
+    
+    billing_mgr = get_billing_manager()
+    
+    try:
+        result = billing_mgr.update_subscription_tier(user, tier, session)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except StripeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/billing/cancel")
+async def cancel_subscription(
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Cancel subscription at end of current period."""
+    from app.services.billing import get_billing_manager, StripeError
+    
+    billing_mgr = get_billing_manager()
+    
+    try:
+        result = billing_mgr.cancel_subscription(user, session, at_period_end=True)
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except StripeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/billing/subscription")
+async def get_subscription_info(
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Get current subscription info."""
+    from app.schemas.tts import SubscriptionResponse
+    from app.models.db import Subscription
+    
+    subscription = session.exec(select(Subscription).where(Subscription.user_id == user.id)).first()
+    
+    if not subscription:
+        return SubscriptionResponse(
+            tier="free",
+            status="inactive",
+        )
+    
+    return SubscriptionResponse(
+        tier=subscription.tier,
+        status=subscription.status,
+        current_period_start=subscription.current_period_start,
+        current_period_end=subscription.current_period_end,
+        monthly_character_limit=subscription.monthly_character_limit,
+        monthly_price=subscription.monthly_price_cents / 100,
+        stripe_subscription_id=subscription.stripe_subscription_id,
+    )
+
+
+@app.get("/billing/upcoming-invoice")
+async def get_upcoming_invoice(
+    user: User = Depends(get_current_user),
+):
+    """Get preview of next invoice."""
+    from app.services.billing import get_billing_manager
+    from app.schemas.tts import UpcomingInvoiceResponse
+    
+    billing_mgr = get_billing_manager()
+    invoice = billing_mgr.get_upcoming_invoice(user)
+    
+    if not invoice:
+        raise HTTPException(status_code=400, detail="No upcoming invoice")
+    
+    return invoice
+
+
+@app.get("/billing/invoices")
+async def list_invoices(
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+    limit: int = 10,
+    skip: int = 0,
+):
+    """List user's invoices."""
+    from app.models.db import Invoice
+    
+    invoices = session.exec(
+        select(Invoice)
+        .where(Invoice.user_id == user.id)
+        .order_by(Invoice.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    ).all()
+
+    total_invoices = len(session.exec(select(Invoice).where(Invoice.user_id == user.id)).all())
+    
+    return {
+        "invoices": [
+            {
+                "id": inv.id,
+                "stripe_invoice_id": inv.stripe_invoice_id,
+                "amount": inv.total_amount / 100,
+                "status": inv.stripe_status,
+                "period_start": inv.period_start,
+                "period_end": inv.period_end,
+                "paid": inv.paid,
+                "pdf_url": inv.invoice_pdf_url,
+            }
+            for inv in invoices
+        ],
+        "total": total_invoices,
+    }
+
+
+@app.get("/billing/usage")
+async def get_usage_info(
+    user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
+):
+    """Get current usage and billing info."""
+    from app.models.db import Subscription
+    from app.schemas.tts import UsageResponse
+    
+    subscription = session.exec(select(Subscription).where(Subscription.user_id == user.id)).first()
+    
+    if not subscription:
+        return UsageResponse(
+            tier="free",
+            usage_characters=user.current_month_usage_characters,
+            remaining_quota=user.monthly_synthesis_quota - user.current_month_usage_characters,
+            usage_cost=0.0,
+            monthly_charge=0.0,
+            cost_per_million_chars=0.0,
+        )
+    
+    remaining = subscription.monthly_character_limit - user.current_month_usage_characters
+    current_cost = user.current_month_cost_cents / 100
+    
+    pricing = settings.STRIPE_PRICING[subscription.tier]
+    
+    return UsageResponse(
+        tier=subscription.tier,
+        usage_characters=user.current_month_usage_characters,
+        remaining_quota=remaining if remaining > 0 else 0,
+        usage_cost=current_cost,
+        monthly_charge=subscription.monthly_price_cents / 100,
+        cost_per_million_chars=pricing["overage_price_per_million_cents"] / 100,
+        period_end=subscription.current_period_end,
+    )
+
+
+@app.post("/webhooks/stripe")
+async def stripe_webhook(
+    request: Request,
+    session: Session = Depends(get_session),
+):
+    """Handle Stripe webhooks."""
+    from app.services.billing import BillingManager
+    from fastapi import Request
+    
+    body = await request.body()
+    signature = request.headers.get("stripe-signature")
+    
+    if not signature:
+        raise HTTPException(status_code=400, detail="Missing stripe-signature")
+    
+    try:
+        event = BillingManager.verify_webhook_signature(body.decode(), signature)
+    except Exception as e:
+        logger.error(f"Webhook verification failed: {str(e)}")
+        raise HTTPException(status_code=400, detail="Invalid signature")
+    
+    billing_mgr = get_billing_manager()
+    
+    # Handle different event types
+    if event["type"] == "customer.subscription.updated":
+        BillingManager.handle_subscription_updated(
+            event["data"]["object"]["id"],
+            session
+        )
+    
+    elif event["type"] == "customer.subscription.deleted":
+        BillingManager.handle_subscription_deleted(
+            event["data"]["object"]["id"],
+            session
+        )
+    
+    elif event["type"] == "invoice.payment_succeeded":
+        BillingManager.handle_invoice_payment_succeeded(
+            event["data"]["object"]["id"],
+            session
+        )
+    
+    elif event["type"] == "invoice.payment_failed":
+        BillingManager.handle_invoice_payment_failed(
+            event["data"]["object"]["id"],
+            session
+        )
+        logger.warning(f"Payment failed for invoice {event['data']['object']['id']}")
+    
+    return {"status": "received"}
+
+
 # ============ Streaming Endpoints ============
 
 @app.get("/synthesis/{job_id}/stream")
@@ -1243,7 +1874,7 @@ async def stream_synthesis(
 ):
     """Stream audio as it's being synthesized (WebSocket alternative)."""
     
-    job = session.query(SynthesisJob).filter(SynthesisJob.id == job_id).first()
+    job = session.exec(select(SynthesisJob).where(SynthesisJob.id == job_id)).first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     
@@ -1300,7 +1931,7 @@ async def websocket_synthesize(
                 continue
             
             # Verify voice exists
-            voice = session.query(Voice).filter(Voice.id == voice_id).first()
+            voice = session.exec(select(Voice).where(Voice.id == voice_id)).first()
             if not voice:
                 await websocket.send_json({
                     "type": "error",

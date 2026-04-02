@@ -88,12 +88,15 @@ async def get_current_user_from_api_key(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing X-API-Key header",
         )
+
+    security_mgr = get_security_manager()
+    hashed_api_key = security_mgr.hash_api_key(x_api_key)
     
     # Query database for API key
     from app.models.db import APIKeyModel
     
     api_key_model = session.query(APIKeyModel).filter(
-        APIKeyModel.hashed_key == x_api_key,
+        APIKeyModel.hashed_key == hashed_api_key,
         APIKeyModel.active == True,
     ).first()
     
@@ -114,6 +117,7 @@ async def get_current_user_from_api_key(
     # Update last_used
     import datetime
     api_key_model.last_used = datetime.datetime.utcnow()
+    api_key_model.requests_count += 1
     session.add(api_key_model)
     session.commit()
     

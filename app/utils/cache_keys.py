@@ -17,7 +17,18 @@ class CacheKeyGenerator:
         style: str = "normal",
         speed: float = 1.0,
         pitch: float = 1.0,
+        emotion: str = "",
+        secondary_emotion: str = "",
+        emotion_blend: float = 0.0,
+        emotion_intensity: float = 1.0,
+        emotion_curve: str = "static",
+        prosody_template: str = "",
         model: str = "tortoise",
+        prosody_template_axes: str = "",
+        template_composition: str = "",
+        auto_template: bool = False,
+        ml_refinement: bool = True,
+        phoneme_alignment: bool = True,
     ) -> str:
         """
         Generate a deterministic cache key for synthesis results.
@@ -45,6 +56,17 @@ class CacheKeyGenerator:
             "style": style,
             "speed": round(speed, 2),  # Round to avoid floating point issues
             "pitch": round(pitch, 2),
+            "emotion": emotion or "",
+            "secondary_emotion": secondary_emotion or "",
+            "emotion_blend": round(emotion_blend, 2),
+            "emotion_intensity": round(emotion_intensity, 2),
+            "emotion_curve": emotion_curve,
+            "prosody_template": prosody_template or "",
+            "prosody_template_axes": prosody_template_axes or "",
+            "template_composition": template_composition or "",
+            "auto_template": str(auto_template),
+            "ml_refinement": str(ml_refinement),
+            "phoneme_alignment": str(phoneme_alignment),
             "cache_version": CacheKeyGenerator.CACHE_VERSION,
         }
         

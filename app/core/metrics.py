@@ -185,6 +185,38 @@ concurrent_requests = Gauge(
     registry=metrics_registry,
 )
 
+prosody_quality_score = Histogram(
+    "tts_prosody_quality_score",
+    "Composite prosody quality score",
+    ["mode"],
+    buckets=(0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 1.0),
+    registry=metrics_registry,
+)
+
+prosody_naturalness_score = Histogram(
+    "tts_prosody_naturalness_score",
+    "Prosody naturalness score",
+    ["mode"],
+    buckets=(0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 1.0),
+    registry=metrics_registry,
+)
+
+prosody_emotion_accuracy_score = Histogram(
+    "tts_prosody_emotion_accuracy_score",
+    "Prosody emotional accuracy score",
+    ["mode"],
+    buckets=(0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 1.0),
+    registry=metrics_registry,
+)
+
+prosody_timing_correctness_score = Histogram(
+    "tts_prosody_timing_correctness_score",
+    "Prosody timing correctness score",
+    ["mode"],
+    buckets=(0.1, 0.25, 0.4, 0.55, 0.7, 0.85, 1.0),
+    registry=metrics_registry,
+)
+
 circuit_breaker_open_gauge = Gauge(
     "tts_circuit_breaker_open",
     "Circuit breaker open state (1=open, 0=closed)",
@@ -256,6 +288,21 @@ class MetricsCollector:
     def record_queue_wait_time(duration: float):
         """Record time spent waiting in queue."""
         queue_processing_duration_seconds.observe(duration)
+
+    @staticmethod
+    def record_prosody_scores(
+        *,
+        mode: str,
+        naturalness: float,
+        emotional_accuracy: float,
+        timing_correctness: float,
+        composite: float,
+    ):
+        """Record prosody quality telemetry."""
+        prosody_naturalness_score.labels(mode=mode).observe(naturalness)
+        prosody_emotion_accuracy_score.labels(mode=mode).observe(emotional_accuracy)
+        prosody_timing_correctness_score.labels(mode=mode).observe(timing_correctness)
+        prosody_quality_score.labels(mode=mode).observe(composite)
     
     @staticmethod
     def set_active_workers(queue: str, count: int):

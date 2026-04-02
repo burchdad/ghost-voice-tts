@@ -6,11 +6,13 @@ Tracks usage in Redis for distributed rate limiting.
 """
 
 import time
+import logging
 from typing import Tuple, Optional
 from enum import Enum
 
-from app.core.cache import RedisCache
-from app.core.config import settings
+from app.services.cache import RedisCache, get_redis_cache
+
+logger = logging.getLogger(__name__)
 
 
 class RateLimitTier(str, Enum):
@@ -176,10 +178,25 @@ class RateLimiter:
         Returns:
             (allowed: bool, remaining_tokens: int, reset_after_seconds: int)
         """
+        # Fail open if Redis is unavailable to preserve API availability.
+        try:
+            return self._check_bucket_sync(key, capacity, refill_rate, cost)
+        except Exception as e:
+            logger.warning(f"Rate limiter backend unavailable; allowing request: {e}")
+            return True, capacity, 0
+
+    def _check_bucket_sync(
+        self,
+        key: str,
+        capacity: int,
+        refill_rate: float,
+        cost: int,
+    ) -> Tuple[bool, int, int]:
+        """Synchronous token bucket implementation backed by Redis."""
         now = time.time()
         
         # Get current bucket state
-        bucket_data = await self.cache.client.hgetall(key)
+        bucket_data = self.cache.client.hgetall(key)
         
         if not bucket_data:
             # New bucket: fill it
@@ -202,7 +219,7 @@ class RateLimiter:
             allowed = False
         
         # Store updated bucket state
-        await self.cache.client.hset(
+        self.cache.client.hset(
             key,
             mapping={
                 b'tokens': str(tokens),
@@ -211,7 +228,7 @@ class RateLimiter:
         )
         
         # Set expiration (clean up old buckets)
-        await self.cache.client.expire(key, 3600)
+        self.cache.client.expire(key, 3600)
         
         # Calculate reset time (when bucket will be full)
         if tokens < capacity:
@@ -251,9 +268,9 @@ class RateLimiter:
         pattern = f"rate_limit:*:{user_id}:*"
         
         while True:
-            cursor, keys = await self.cache.client.scan(cursor, match=pattern)
+            cursor, keys = self.cache.client.scan(cursor, match=pattern)
             for key in keys:
-                await self.cache.client.delete(key)
+                self.cache.client.delete(key)
             if cursor == 0:
                 break
 
@@ -266,7 +283,6 @@ def get_rate_limiter() -> RateLimiter:
     """Get or create rate limiter instance."""
     global _rate_limiter
     if _rate_limiter is None:
-        from app.core.cache import get_redis_cache
         cache = get_redis_cache()
         _rate_limiter = RateLimiter(cache)
     return _rate_limiter
