@@ -48,7 +48,7 @@ env/
 htmlcov/
 
 # Models cache
-models/
+/models/
 *.pth
 *.pt
 
